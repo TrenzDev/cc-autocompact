@@ -1,0 +1,11 @@
+{
+  "name": "cc-autocompact",
+  "version": "0.4.0",
+  "description": "Auto-compact for Claude Code when the task ends, not when the context window is full. When the model ends a task with 'Ready to compact.', the mod runs /compact, saves the summary and puts the handoff back. Adds /compact-now.",
+  "types": "./types/index.d.ts",
+  "author": { "name": "Mario TM" },
+  "homepage": "https://github.com/TrenzDev/cc-autocompact",
+  "repository": "https://github.com/TrenzDev/cc-autocompact",
+  "license": "MIT",
+  "keywords": ["auto-compact", "autocompact", "compact", "context-window", "token-usage", "handoff", "claude-code-mod"]
+}

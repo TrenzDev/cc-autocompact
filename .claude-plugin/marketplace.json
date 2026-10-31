@@ -1,0 +1,14 @@
+{
+  "name": "cc-autocompact",
+  "owner": {
+    "name": "Mario TM"
+  },
+  "description": "Auto-compact for Claude Code at the end of each task: one plugin, no Python, no settings to edit.",
+  "plugins": [
+    {
+      "name": "cc-autocompact",
+      "source": "./plugin",
+      "description": "Auto-compact for Claude Code when the task ends, not when the context window is full."
+    }
+  ]
+}
