@@ -13,7 +13,7 @@ Claude Code compacts on its own when the context window is nearly full. By then 
 
 So I moved the trigger. When the model finishes a task and the next one doesn't need that context, it writes a short handoff to disk and ends its message with one line: `Ready to compact.` The plugin sees that line and runs `/compact`. It saves the summary and puts the handoff back into the fresh context. Same session, same thread, a lot less weight.
 
-There is no size limit. If a task needs a million tokens, it gets a million tokens.
+Size never compacts anything. If a task needs a million tokens, it gets a million tokens. Past 400k the plugin only asks the model, now and then, whether the task is closed.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/demo-dark.svg">
@@ -85,19 +85,33 @@ The first live run was on 31 October 2026: the plugin saw the line and compacted
   <img alt="Task done, the model asks whether the next task needs this context; wrap-up writes the handoff and ends with Ready to compact.; the mod waits 1.5 s and queues /compact; the summary is saved to disk; the handoff goes back into the fresh context." src="assets/flow-light.svg" width="100%">
 </picture>
 
-1. **The model decides.** At the end of a task it asks: does the next task need this context? If not, it runs the `wrap-up` skill, which updates a handoff file and ends with the exact line `Ready to compact.` If yes, or if it isn't sure, it keeps working.
+1. **The model decides.** At the end of a task it asks: does the next task need this context? If not, it runs the `wrap-up` skill, which updates a handoff file and ends with the exact line `Ready to compact.` If yes, or if it isn't sure, it keeps working. Models forget, so when a message comes in and the context is high, the mod [asks the question for it](#the-reminder).
 2. **The mod acts.** It sees that line when the turn ends and queues `/compact`, as if you had typed it. It has to be a mod: no hook, no skill and not the model itself can run `/compact`.
 3. **Nothing is lost.** The handoff is written before anything happens. When the compaction ends, the mod saves the full summary to disk and puts the handoff back into the fresh context.
 
 `/compact-now` does it on demand: wrap-up, then compact, in any session and with no floor. I compact instead of `/clear` to keep the thread and the visible history. Every design choice, with links to the official docs, is in [docs/DECISIONS.md](docs/DECISIONS.md). Events, state and failure modes are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+### The reminder
+
+A rule in `CLAUDE.md` depends on the model remembering it. In my sessions it didn't: the first six compactions all came from someone asking, with 500k to 880k of context on board. So when a message comes in between turns on the main thread, from you or from another session, and the context has crossed a new band (from 400k, once on crossing and again every 100k more), the model gets one short question next to the message:
+
+> [cc-autocompact] Context is at 512k. This is a question, not an order: is the task closed, and does what comes next not need this context?
+> If yes: answer this message if it is short; if it asks for something long, leave it as the next step and say you will need a nudge after compacting. Wrap up (the wrap-up skill, unless your instructions name another) and end with the exact line "Ready to compact.".
+> If no (a task in progress, a long document, a batch, the user iterating), or you aren't sure: carry on and don't mention this. Using the whole context window is fine when the task needs it.
+
+It asks, and that's all it does. Nothing compacts unless the model writes the marker, and it may keep going to the end of the window if the task needs it. It stays quiet while a turn is running, and for background tasks, commands and subagents. It starts over after any compaction. Each question is about 150 tokens, and there are at most seven between 400k and a million.
+
+A message can also arrive during the 1.5 seconds before a compaction and cancel it. The model is told so, once, next to that message, and asked to write the marker again when it finishes answering, if that still applies. Nothing used to tell it, and the compaction was lost until someone remembered.
+
+The numbers are `reminder_tokens` and `reminder_every_tokens`, and `"reminder": false` turns both notes off. In a window under a million, the threshold drops to 40% of the window and the step to 10%, never below `min_context_tokens`. The reasoning, with the numbers I simulated, is in [D19](docs/DECISIONS.md#d19-size-may-ask-it-never-decides).
+
 ## What's in the repo
 
 | Piece | Where | What it does |
 | --- | --- | --- |
-| The plugin | [`plugin/`](plugin/) | One mod plus one skill. The mod compacts when it sees the marker, saves every compaction summary, puts the handoff back after a compaction or a `/clear`, and adds `/compact-now`. It talks through short toasts and logs each compaction to a JSONL file. |
+| The plugin | [`plugin/`](plugin/) | One mod plus one skill. The mod compacts when it sees the marker, asks the model whether the task is closed when the context is high, saves every compaction summary, puts the handoff back after a compaction or a `/clear`, and adds `/compact-now`. It talks through short toasts and logs each compaction to a JSONL file. |
 | `wrap-up` skill | [`plugin/skills/wrap-up/`](plugin/skills/wrap-up/SKILL.md) | When to close, the handoff file, an optional step for your own system, and the marker line. |
-| Tests | [`plugin/hooks/register.test.ts`](plugin/hooks/register.test.ts) | 67 tests that run against the real engine with `claude plugin test plugin`, 28 of them on security. |
+| Tests | [`plugin/hooks/register.test.ts`](plugin/hooks/register.test.ts) | 89 tests that run against the real engine with `claude plugin test plugin`, 30 of them on security. |
 | Security | [`SECURITY.md`](SECURITY.md) | What it reads and writes (no network, no shell), the threat model, and how to report a problem privately. |
 | Meter | [`tools/measure_context.py`](tools/measure_context.py) | Reads your local transcripts and tells you how much of your token usage is carrying context. Compares two weeks with `--compare`. |
 | Installers | [`install.sh`](install.sh), [`install.ps1`](install.ps1) | For a clone, without the marketplace. |
@@ -111,7 +125,10 @@ Nothing is required. To change something, create `~/.claude/cc-autocompact/confi
 | --- | --- | --- |
 | `enabled` | `true` | Switch for the automatic trigger. With `false`, only `/compact-now` works. |
 | `sessions` | `["*"]` | Which sessions compact on their own. `["*"]`: all of them (the marker only shows up when the model closes a task). A list like `["Backend", "Docs"]`: only sessions whose title in the desktop app contains one of those words. `[]`: none. |
-| `min_context_tokens` | `80000` | Below this, the marker doesn't compact: compacting something small isn't worth it. The only number in the system. It is a floor, never a ceiling. |
+| `min_context_tokens` | `80000` | Below this, the marker doesn't compact: compacting something small isn't worth it. It is a floor, never a ceiling. |
+| `reminder` | `true` | Switch for [the reminder](#the-reminder) and for the note about a cancelled compaction. With `false`, the mod adds nothing to your messages. |
+| `reminder_tokens` | `400000` | The context the reminder starts asking at (or 40% of the window, if that is less). It only asks: it never compacts. |
+| `reminder_every_tokens` | `100000` | How many tokens more before it asks again (or 10% of the window, if that is less). |
 | `delay_ms` | `1500` | Time between the toast and the compaction. A message from you or a new turn in that window cancels it. |
 | `marker` | `"Ready to compact."` | The last line that means "task closed, everything saved". Change it for another language, and change the skill's last line to match. |
 | `compact_instructions` | keep decisions, paths, pending, next step | What the summary must keep (what goes after `/compact`). Write it in the language you want your summaries in. |
@@ -142,7 +159,7 @@ Each compaction adds one line to the log:
 
 ## Day to day
 
-- Most of the time you do nothing. With the rule in your `CLAUDE.md`, the model closes each task that doesn't need its context carried forward, and the session compacts by itself. You'll see two short toasts.
+- Most of the time you do nothing. With the rule in your `CLAUDE.md`, the model closes each task that doesn't need its context carried forward, and the session compacts by itself. You'll see two short toasts. Past 400k the model also gets [a short question](#the-reminder) now and then, which you don't see.
 - **`/wrap-up`**: close the task yourself. If the session is above the floor, it compacts.
 - **`/compact-now`**: wrap up and compact now, in any session, with no floor.
 - To keep the context, tell the model ("I'll keep going with this later"). If you see the compaction toast and don't want it, send anything in the next second and a half.
@@ -152,7 +169,7 @@ Each compaction adds one line to the log:
 1. **Floor.** In a small session (under 80k), run `/wrap-up`. When it ends with `Ready to compact.` you get "under the 80k floor: not compacting".
 2. **Trigger.** In a session above 80k, run `/wrap-up`. You get "Task wrapped up at …k: compacting in a moment", `/compact` running, and "Compacted: …k to …k". Ask what was pending: it should answer without re-reading anything.
 3. **Trail.** A new line in `~/.claude/cc-autocompact/compactions.jsonl` and a summary in `~/.claude/compaction-summaries/<project>/`.
-4. **Cancel.** Repeat step 2 and send any message within 1.5 s: "Compaction cancelled".
+4. **Cancel.** Repeat step 2 and send any message within 1.5 s: "Compaction cancelled". With `"debug": true`, `debug.jsonl` gets a line with `"event":"reminder","kind":"cancelled"`, which is the note the model got.
 
 If something doesn't match, set `"debug": true` and try again: the mod explains every decision.
 
@@ -171,7 +188,7 @@ Four layers. (1) The handoff is written first; if anything fails, the skill does
 I don't know yet from a full week. The simulation on a week of my data gave 28% to 37%, but it assumed a clean restart with a small handoff. Compacting leaves a summary behind (about 30k in my data, plus what Claude Code reloads by itself: system prompt, tools, `CLAUDE.md`, memory), and you pay for the request that writes it. In my first live run the next turn was 123k, because my base is heavy. So the real saving will be lower than the simulation. Measure it yourself, before and after (below).
 
 **There are other tools for this. Which one do I want?**
-Some I know of, all from the last few weeks: [compactly](https://github.com/swapnildahiphale/compactly) asks a second model at each new prompt whether this is a good moment to compact. [catnap](https://github.com/LippInc/catnap) lets Claude compact itself once the context passes 50%. [claude-auto-handoff](https://github.com/alexknowshtml/claude-auto-handoff) hands a long session to a fresh one with a brief, instead of compacting. This one has no size threshold and no second model: the model that did the work says when the task is over, and the handoff file is written before anything is compacted. If you want compaction by size, Claude Code's own `/autocompact` setting already does that.
+Some I know of, all from the last few weeks: [compactly](https://github.com/swapnildahiphale/compactly) asks a second model at each new prompt whether this is a good moment to compact. [catnap](https://github.com/LippInc/catnap) lets Claude compact itself once the context passes 50%. [claude-auto-handoff](https://github.com/alexknowshtml/claude-auto-handoff) hands a long session to a fresh one with a brief, instead of compacting. In this one size never compacts anything and there is no second model: the model that did the work says when the task is over, and the handoff file is written before anything is compacted. Past 400k the plugin only reminds it to ask itself. If you want compaction by size, Claude Code's own `/autocompact` setting already does that.
 
 **Why does the mod run `/compact` instead of `$.session.compact()`?**
 Because in the desktop app every session runs headless (SDK), and on engine 2.1.309 `$.session.compact()` always rejects there: *"not available in a headless (-p / SDK) session yet: compaction here runs inside a turn (a /compact prompt)"*. The mod queues `/compact` with `$.command.run`, which runs the command as if you typed it, as soon as the session is idle. See the [CHANGELOG](CHANGELOG.md).
@@ -180,10 +197,10 @@ Because in the desktop app every session runs headless (SDK), and on engine 2.1.
 Set `"debug": true` in `config.json` (applies right away). Every turn end shows a toast like `debug: reason=answer · answer=yes "…Ready to compact." · ctx=746k · decision: compact`, or `decision: no: <why>`, and writes the same line to `debug.jsonl`. Common reasons: `no marker`, `under the floor`, `enabled is false`, `is not in sessions`, `already compacted, no new turn since`. If `/compact-now` doesn't show up when you type `/`, the plugin didn't load: check `claude plugin list`.
 
 **Does it affect subagents?**
-No. The mod ignores subagent turns and only acts on the main thread.
+No. The mod ignores subagent turns and only acts on the main thread. The reminder doesn't reach them either.
 
 **What if the model never closes a task?**
-Then nothing happens and everything works as it did before. Check that the rule is in your `CLAUDE.md`, or use `/compact-now`.
+Then nothing compacts until Claude Code's own auto-compact does, and that is fine. Past 400k [the reminder](#the-reminder) asks it, and it can always say no. Check that the rule is in your `CLAUDE.md`, or use `/compact-now`.
 
 ## Known limits
 
@@ -192,6 +209,8 @@ Then nothing happens and everything works as it did before. Check that the rule 
 - A mod can't send text that starts with `/`, so `/compact-now` runs the skill as a command and, if that fails, asks for it in plain words.
 - The session title isn't in the API. The mod reads it from the desktop app's own files, and only needs it for a list in `sessions`. With `["*"]` it doesn't.
 - Checked live: the compaction and the saved summary. Putting the handoff back after a compaction now runs inside the mod (until 0.3.0 it was a separate hook); it is covered by tests, and the live check is on the list for the first week.
+- The reminder was checked on engine 2.1.309 run the way the desktop app runs it, with a local server in the model's place that records what the engine sends. So the question and the note are in the real request, including for a real message from another session during the delay. What the model does with the question hasn't been measured yet.
+- After a compaction the session waits for you. If the message that brought the question also asked for something long, the model leaves it as the next step and says so, but someone has to say "go on". The mod doesn't.
 - What goes back after a compaction is the copy of the handoff taken when the last wrap-up ended. If you edit the file by hand after that, your edit comes back after the next wrap-up. In a project where no wrap-up has run, nothing comes back. That's on purpose ([SECURITY.md](SECURITY.md)).
 - The mod API has no append. The log is read and rewritten, so two compactions in the same instant could overwrite one line.
 - Any answer ending in the marker triggers it. If you have other closing skills, give them another last line, or let them compact on purpose.

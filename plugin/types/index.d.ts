@@ -35,6 +35,10 @@ export type State = {
   pathWarned: boolean
   // already warned that the Handoff: line in CLAUDE.md is not a .md file inside the project
   handoffWarned: boolean
+  // the reminder: the last band of context it asked in (-1 = none)
+  remindedBand: number
+  // a compaction was cancelled and the model doesn't know yet: it goes with the next message
+  cancelOwed: boolean
 }
 
 // config.json. Every key is optional: a missing file or key takes the default (see the README).
@@ -60,6 +64,12 @@ export type Config = {
   // the compaction log: "" = <claude dir>/cc-autocompact/compactions.jsonl; any other is a .jsonl inside that folder
   log_file: string
   app_sessions_dir: string
+  // switch for the reminder and for the note about a cancelled compaction
+  reminder: boolean
+  // the context the reminder starts asking at (or 40% of the window, if that is less)
+  reminder_tokens: number
+  // how many tokens more before it asks again (or 10% of the window, if that is less)
+  reminder_every_tokens: number
 }
 
 declare module 'claude-code' {

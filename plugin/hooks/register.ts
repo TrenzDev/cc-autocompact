@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TurnCompleteInput } from 'claude-code'
+import type { EngineInterface, PromptSubmitInput, Register, TurnCompleteInput } from 'claude-code'
 
 import type { Config, State } from '../types'
 
@@ -33,6 +33,12 @@ const DELAY_CAP_MS = 60_000
 const INSTRUCTIONS_CAP = 4_000
 const MARKER_CAP = 100
 const SESSIONS_CAP = 50
+// The reminder: in a window under a million tokens, the threshold and the step drop to 40% and 10% of the window
+const REMINDER_THRESHOLD_SHARE = 0.4
+const REMINDER_STEP_SHARE = 0.1
+const REMINDER_MIN_STEP = 1000
+// What doesn't bring a message from the user or from another session: no question there
+const NO_QUESTION = ['task-notification', 'plugin', 'auto-continuation', 'scheduled-trigger', 'observer', 'observer-activity']
 
 const INITIAL: State = {
   phase: 'idle',
@@ -56,6 +62,8 @@ const INITIAL: State = {
   configWarned: false,
   pathWarned: false,
   handoffWarned: false,
+  remindedBand: -1,
+  cancelOwed: false,
 }
 
 // With no config.json the mod runs on these values. A key missing from config.json takes its value from here.
@@ -74,9 +82,12 @@ const DEFAULTS: Config = {
   handoff_max_chars: 12_000,
   log_file: '',
   app_sessions_dir: '',
+  reminder: true,
+  reminder_tokens: 400_000,
+  reminder_every_tokens: 100_000,
 }
 
-const state = atom({ plugin: 'cc-autocompact', key: 'state' } as const, INITIAL, { shape: 'state-3' })
+const state = atom({ plugin: 'cc-autocompact', key: 'state' } as const, INITIAL, { shape: 'state-4' })
 
 const k = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`)
 const fold = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
@@ -229,6 +240,9 @@ const loadConfig = async ($: EngineInterface): Promise<Loaded> => {
         handoff_max_chars: Math.max(HANDOFF_MIN, Math.min(num(j.handoff_max_chars, DEFAULTS.handoff_max_chars), HANDOFF_CAP)),
         log_file: str(j.log_file, DEFAULTS.log_file),
         app_sessions_dir: line(j.app_sessions_dir, DEFAULTS.app_sessions_dir, 1000),
+        reminder: bool(j.reminder, DEFAULTS.reminder),
+        reminder_tokens: num(j.reminder_tokens, DEFAULTS.reminder_tokens),
+        reminder_every_tokens: num(j.reminder_every_tokens, DEFAULTS.reminder_every_tokens),
       },
       problem: '',
     }
@@ -428,7 +442,9 @@ const closeCompaction = async (
     before = s.compactBefore
     trigger = s.compactTrigger
 
-    return mine ? { ...s, compacting: false, scheduled: false, justCompacted: true } : s
+    return mine
+      ? { ...s, compacting: false, scheduled: false, justCompacted: true, remindedBand: -1, cancelOwed: false }
+      : s
   })
   if (!mine) return 'already closed'
   // If the number has not dropped yet, log it without "after" (the app updates it on the next turn)
@@ -451,7 +467,12 @@ const queueCompact = async ($: EngineInterface, gen: number, trigger: string, at
     const s = await read($, state)
     // A message or a turn during the delay cancels it
     if (s.gen !== gen || s.inTurn || s.justCompacted || s.compacting) {
-      await update($, state, x => ({ ...x, scheduled: false }))
+      await update($, state, x => ({
+        ...x,
+        scheduled: false,
+        // If a turn cancelled it rather than a message, nobody has told the model yet: it goes with the next message
+        cancelOwed: x.cancelOwed || (x.scheduled && !s.justCompacted && !s.compacting),
+      }))
       $.ui.toast('Compaction cancelled: there is new activity')
       await debugLog($, cfg, {
         event: 'compact',
@@ -591,7 +612,7 @@ const onTurnEnd = async (
   if (s1.inTurn) return 'no: a turn is running'
 
   const gen = s1.gen
-  await update($, state, s => ({ ...s, scheduled: true, scheduledAt: now }))
+  await update($, state, s => ({ ...s, scheduled: true, scheduledAt: now, cancelOwed: false }))
   $.ui.toast(`Task wrapped up at ${k(tokens)}: compacting in a moment`)
   $.clock.after(cfg.delay_ms, () => void queueCompact($, gen, trigger, 1))
 
@@ -721,6 +742,78 @@ const loadSnapshot = async ($: EngineInterface, root: string): Promise<Snapshot 
   return j as Snapshot
 }
 
+// How the two texts below name the marker. A custom marker is not quoted: nothing from config.json goes in
+const markerWords = (cfg: Config) =>
+  plain(cfg.marker) === plain(DEFAULTS.marker) ? `the exact line "${DEFAULTS.marker}"` : 'the marker line your wrap-up ends with'
+
+// The two texts the mod adds to a message. Fixed text plus the context figure: nothing from the transcript, a file
+// or config.json, so they can't carry an injection. They only ask or tell: the only thing that compacts is the
+// marker the model itself writes.
+const questionText = (tokens: number, cfg: Config) =>
+  `[cc-autocompact] Context is at ${k(tokens)}. This is a question, not an order: is the task closed, and does what comes next not need this context?\n` +
+  `If yes: answer this message if it is short; if it asks for something long, leave it as the next step and say you will need a nudge after compacting. Wrap up (the wrap-up skill, unless your instructions name another) and end with ${markerWords(cfg)}.\n` +
+  "If no (a task in progress, a long document, a batch, the user iterating), or you aren't sure: carry on and don't mention this. Using the whole context window is fine when the task needs it."
+
+const cancelText = (tokens: number, cfg: Config) =>
+  `[cc-autocompact] The compaction you asked for was cancelled because a message came in (context is at ${k(tokens)}). ` +
+  `Answer the message and, if it still applies, end your reply with ${markerWords(cfg)}, without repeating the wrap-up unless there is something new to note. ` +
+  "If it no longer applies, carry on and don't mention this."
+
+// Which band of the reminder the context is in: -1 under the threshold, 0 from the threshold, 1 one step on...
+// Never under the floor: the marker wouldn't compact there.
+const bandOf = (tokens: number, window: number, cfg: Config): number => {
+  const w = window > 0 ? window : Number.POSITIVE_INFINITY
+  const threshold = Math.max(cfg.min_context_tokens, Math.min(cfg.reminder_tokens, w * REMINDER_THRESHOLD_SHARE))
+  const step = Math.max(REMINDER_MIN_STEP, Math.min(cfg.reminder_every_tokens, w * REMINDER_STEP_SHARE))
+
+  return tokens < threshold ? -1 : Math.floor((tokens - threshold) / step)
+}
+
+// The session is on the config.json list (the same rule as the automatic trigger)
+const sessionAllowed = async ($: EngineInterface, cfg: Config): Promise<boolean> => {
+  if (cfg.sessions.includes('*')) return true
+  const title = await readTitle($, cfg, await $.clock.now())
+  if (title === null) return false
+  const t = fold(title)
+
+  return cfg.sessions.some(name => t.includes(fold(name)))
+}
+
+type Note = { text: string; kind: 'question' | 'cancelled'; tokens: number; band: number }
+
+// What goes with a message coming in, if anything. The state is written once the message has really entered.
+const noteForMessage = async ($: EngineInterface, e: PromptSubmitInput, s: State): Promise<Note | null> => {
+  const { cfg } = await loadConfig($)
+  // With the automatic trigger off the marker would do nothing, so there is nothing to ask
+  if (!cfg.reminder || !cfg.enabled || s.compacting) return null
+  const { tokens, window } = (await $.session.usage()).context
+  if (tokens === undefined) {
+    // A new or just compacted session (by anyone): there is no figure until the next response, and it all starts again
+    await update($, state, x => ({ ...x, remindedBand: -1, cancelOwed: false }))
+
+    return null
+  }
+  const band = bandOf(tokens, window, cfg)
+  // The context went down (a compaction that leaves a lot, say): crossing again asks again
+  if (band < s.remindedBand) await update($, state, x => ({ ...x, remindedBand: band }))
+  // A command carries no note: what is owed waits for the next message
+  if (e.command !== undefined) return null
+  if (s.cancelOwed) {
+    if (!(await sessionAllowed($, cfg))) return null
+
+    return { text: cancelText(tokens, cfg), kind: 'cancelled', tokens, band }
+  }
+  if (band <= s.remindedBand) return null
+  // With a turn running (the main thread's, or a subagent's, which brings its turnId) the task isn't closed:
+  // the band stays pending for the next message between turns
+  if (e.turnId !== undefined || s.inTurn || NO_QUESTION.includes(e.origin.kind)) return null
+  // A wrap-up already running with /compact-now doesn't need the question
+  if (s.phase === 'wrapping' && (await $.clock.now()) - s.wrapStartedAt <= WRAP_TIMEOUT_MS) return null
+  if (!(await sessionAllowed($, cfg))) return null
+
+  return { text: questionText(tokens, cfg), kind: 'question', tokens, band }
+}
+
 // One folder per project for the summaries, named after the project's folder (never "." or "..")
 const projectSlug = (cwd: string) =>
   (slashes(cwd).split('/').pop() ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+|-+$/g, '').slice(0, 60) || 'root'
@@ -741,14 +834,38 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A message from the user cancels any compaction still waiting out its delay
+  // A message (from the user or another session) cancels any compaction still waiting out its delay and, when
+  // it applies, takes the model the news of that cancellation or the reminder's question. It goes as prompt.submit
+  // context: the model reads it beside the message and nobody else sees it. A failure here never stops the message.
   on('prompt.submit', async ($, e, next) => {
+    let s = null as State | null
     try {
-      await update($, state, s => ({ ...s, gen: s.gen + 1 }))
+      const now = await $.clock.now().catch(() => 0)
+      await update($, state, x => {
+        const cancels = x.scheduled && !x.compacting && now - x.scheduledAt <= COMPACT_TIMEOUT_MS
+        s = { ...x, gen: x.gen + 1, scheduled: cancels ? false : x.scheduled, cancelOwed: x.cancelOwed || cancels }
+
+        return s
+      })
+    } catch {}
+    const note = s === null ? null : await noteForMessage($, e, s).catch(() => null)
+    if (note === null) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), note.text] })
+    try {
+      // If the message didn't enter, the note reached nobody: it stays pending
+      if (r.drop === undefined) {
+        await update($, state, x => ({
+          ...x,
+          remindedBand: Math.max(x.remindedBand, note.band),
+          cancelOwed: note.kind === 'cancelled' ? false : x.cancelOwed,
+        }))
+        const { cfg } = await loadConfig($)
+        await debugLog($, cfg, { event: 'reminder', kind: note.kind, origin: e.origin.kind, tokens: note.tokens, band: note.band })
+      }
     } catch {}
 
-    return next(e)
-  })
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {

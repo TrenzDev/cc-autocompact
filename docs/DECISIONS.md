@@ -17,7 +17,7 @@ Official docs cited:
 
 ## D1. The task decides, not the size
 
-**Decision.** No size thresholds: no context ceiling, no "compact above X tokens". It compacts when a task ends and the next one doesn't need its context.
+**Decision.** Size never compacts anything: no context ceiling, no "compact above X tokens". It compacts when a task ends and the next one doesn't need its context. The one number that looks at size, the reminder, only asks the question (see [D19](#d19-size-may-ask-it-never-decides)).
 
 **Why.** Some tasks need the million tokens (a big migration, a long document, a batch of work in progress), and cutting them by size breaks the work. In my measurement, closing at task boundaries captured almost all of the saving; a 300k threshold on top only added two points, and on its own it lost value fast as it went up (see [MEASUREMENT.md](MEASUREMENT.md)).
 
@@ -57,7 +57,7 @@ Official docs cited:
 
 **Decision.** Below 80k of context, the marker doesn't compact (except with `/compact-now`).
 
-**Why.** Compacting a small session saves little and costs a request. It is the only number in the system, and it is a floor, not a ceiling: it never stops you using context, it only avoids pointless compactions.
+**Why.** Compacting a small session saves little and costs a request. It is a floor, not a ceiling: it never stops you using context, it only avoids pointless compactions.
 
 ## D7. A short, cancelable delay
 
@@ -141,11 +141,34 @@ Official docs cited:
 
 **Cost.** A handoff edited by hand after the wrap-up doesn't come back until the next wrap-up. In a project where no wrap-up has run, nothing comes back. Both are the safe side.
 
+## D19. Size may ask, it never decides
+
+**Decision (0.5.0).** When a message from the user or another session comes in between turns on the main thread and the context has crossed a new band (from 400k, then every 100k more), the mod adds a short question next to it, as `prompt.submit` context: is the task closed, and does what comes next not need this context? If a message cancels a compaction waiting out its delay, it brings a note saying so instead, once. Both are fixed text plus a number, and neither compacts anything.
+
+**Why.** D3 leaves the judgment in the model, and that is right, but nothing reminded it. In the log of the first six compactions, none came from the model's own initiative: the user or a coordinating session asked, each time with 500k to 880k of context. D1 still stands: the task decides. What changes is that the model is asked at a moment it can answer, when a new message shows what comes next. The other gap was worse: a message from another session arrived during the 1.5 s delay, the compaction was cancelled (D7, as designed), and nothing told the model it had to ask again.
+
+**Why 400k and 100k.** Simulated over 14 days of my sessions: 140 sessions, 5,891 messages.
+
+| Threshold, step | Questions | Sessions reached | One in every N messages above it |
+| --- | --- | --- | --- |
+| 300k, 100k | 703 | 70 | 5.7 |
+| **400k, 100k** | **511** | **63** | **5.7** |
+| 500k, 100k | 348 | 53 | 5.8 |
+| 400k, 50k | 811 | 63 | 3.6 |
+| 400k, 200k | 315 | 63 | 9.3 |
+
+Going down to 300k spends 38% more questions to reach 7 more sessions. Going up to 500k leaves 10 out. A 50k step asks on every third or fourth message, which gets ignored; a 200k step can carry 200k more before asking again. The count runs high, since compacting earlier means fewer questions, and it doesn't take out the messages that arrive with a turn running. A question is about 150 tokens and there are at most seven up to a million, so it costs far less than carrying the context for one more turn.
+
+**Consequences.** It doesn't ask with a turn running: the task isn't closed, and the band stays pending for the next message between turns. It doesn't ask for background tasks, plugin messages, routines or commands. It starts over by itself after any compaction, a `/compact` you type, auto-compact and `/clear` included, because the engine gives no context figure until the first response of the new context. In a window under a million, the threshold drops to 40% of the window and the step to 10%, never below the floor, or the default would never fire in a 200k window. After a compaction the session waits for a message, so a long request that came with the question stays as the next step until someone says "go on".
+
+**Source.** `PromptSubmitInput.context` in the engine's types (*"What the model reads beside the prompt and the user never sees"*), and engine 2.1.309 run the way the desktop app runs it (long-lived stream-json, `CLAUDE_CODE_PLUGIN_DIRS`, `entrypoint: claude-desktop`), with a local server in the model's place: the note is in the real request, right after the user's message, also for a real message from another session sent through the engine's messaging socket during the delay. It isn't in a subagent's request. A real `/compact` leaves `$.session.usage()` with no figure, and the next crossing asks again. What the model does with the question has not been measured yet. Unlike `$.session.compact()` (D12), this works in the headless host.
+
 ## What was ruled out
 
 | Idea | Why not |
 | --- | --- |
-| Compact above a size (300k, 550k) | It cuts tasks that need their context (D1). |
+| Compact above a size (300k, 550k) | It cuts tasks that need their context (D1). Above a size it only asks (D19). |
+| Ask on every message past a size | A reminder on every message gets ignored, and it costs tokens in every session (D19). |
 | Compact after X minutes idle | The app already has idle compaction, and a pause doesn't mean the task is done. |
 | `/clear` at the end of every task | Loses the history and the thread (D2). |
 | A coordinating session that compacts the others | Not possible from outside (D3). |

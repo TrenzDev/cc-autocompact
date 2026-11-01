@@ -2,6 +2,29 @@
 
 Every notable change goes here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-01
+
+The model now gets asked. The rule in `CLAUDE.md` depended on it remembering, and in the log of the first six compactions it never did.
+
+### Added
+
+- **The reminder.** When a message from you or from another session comes in between turns on the main thread and the context has crossed a new band (from 400k, then every 100k more), the model gets one short question next to it: is the task closed, and does what comes next not need this context? It only asks. Nothing compacts unless the model writes the marker, and going to the end of the window is fine if the task needs it. It starts over after any compaction. In a window under a million, the threshold drops to 40% of the window and the step to 10%. The reasoning and the numbers are in [D19](docs/DECISIONS.md#d19-size-may-ask-it-never-decides).
+- **The note about a cancelled compaction.** If a message cancels a compaction during its delay, it tells the model so, once, and asks it to write the marker again when it finishes answering, if that still applies. Before this, nothing told it and the compaction was lost.
+- New config keys: `reminder`, `reminder_tokens`, `reminder_every_tokens`.
+- 22 tests (89 in all), 2 of them on security.
+
+### Changed
+
+- "No size thresholds" is now "size never compacts anything": the README, D1, D6 and the FAQ say so, because the reminder does look at the size, to ask.
+
+### Security
+
+- Both notes are constants in the code plus one number. Nothing from the transcript, a file or `config.json` goes in, a custom `marker` included. They reach the main thread only, and they can't compact, run anything or grant anything. See [SECURITY.md](SECURITY.md).
+
+### Tested with
+
+- 89 tests with `claude plugin test`, and engine 2.1.309 run the way the desktop app runs it, with a local server in the model's place that records what the engine sends. Not yet observed: what a real model does with the question.
+
 ## [0.4.0] - 2026-10-31
 
 One plugin, installed with one line, that works with no configuration. And a new name.
@@ -98,4 +121,5 @@ First version, in Spanish and private.
 - Windows 11, the Claude Code desktop app with engine 2.1.309.
 - Python 3.12 and Windows PowerShell 5.1.
 
+[0.5.0]: https://github.com/TrenzDev/cc-autocompact/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TrenzDev/cc-autocompact/releases/tag/v0.4.0
