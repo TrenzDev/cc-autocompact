@@ -304,16 +304,26 @@ def measure(data):
 def read_mod_log(paths, w0, w1):
     """Compactions the mod logged in [w0, w1): by trigger, with the context before and after.
     Reads the public log (time, context_before, context_after, trigger) and the older Spanish
-    one (fecha, contexto_antes, contexto_despues, disparador)."""
+    one (fecha, contexto_antes, contexto_despues, disparador). Since 0.6.0 the log also holds
+    decisions, cancellations and the rest: only lines with event "compacted" (or no event, from
+    earlier versions) are compactions, and a later "context_after" line fills in a missing after."""
     rows = []
     for path in paths or []:
         try:
             with open(path, encoding="utf-8") as f:
+                parsed = []
                 for line in f:
                     try:
-                        j = json.loads(line)
+                        parsed.append(json.loads(line))
                     except Exception:
                         continue
+                late_after = {j.get("compaction_id"): j.get("context_after") for j in parsed
+                              if isinstance(j, dict) and j.get("event") == "context_after"}
+                for j in parsed:
+                    if not isinstance(j, dict) or j.get("event", "compacted") != "compacted":
+                        continue
+                    if j.get("context_after") is None and j.get("compaction_id") in late_after:
+                        j = {**j, "context_after": late_after[j["compaction_id"]]}
                     t = to_epoch(j.get("time") or j.get("fecha") or "")
                     if t is None or not (w0 <= t < w1):
                         continue

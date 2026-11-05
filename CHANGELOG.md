@@ -2,6 +2,42 @@
 
 Every notable change goes here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-04
+
+### Added (phase 2)
+
+- **The policy decides.** `decide()` in `plugin/hooks/policy.ts` weighs what a compaction costs now against what it saves later; the marker is still required, and the floor (`min_context_tokens`, now 100k) still applies. New keys: `expected_calls`, `expected_cold_returns`, `margin`, `post_compact_tokens`, `post_compact_cached_tokens`, `summary_tokens`, `main_cache_ttl_minutes`.
+- **Window nearly full** (`hard_cap_share`, 0.85): a turn end compacts even without the marker. Only at a turn end, never on a message.
+- **Idle** (`idle_minutes` 45, `idle_mode` "ask", `idle_min_tokens` 300k): after a quiet stretch with the cache still warm, a closed task compacts; mid-task the model is asked once and compacts only if it answers with the marker.
+- **Pacing** (`pacing`, `five_hour_*_pct`, `seven_day_*_pct`): near a usage limit, messages that did not come from a person get a note to keep work light or defer it; one resume prompt after the reset. A person's message is never touched.
+- **Savings**: an estimate per session and week, and last week's line in `weekly.log` (`usd_per_point` to show points).
+- Frequent log lines go to a per-session file; `compactions.jsonl` keeps the rare ones and is never written back shorter.
+
+### Changed (phase 2)
+
+- `reminder_tokens` defaults to 200k: from there a closed task saves about twice what compacting costs.
+
+## [0.6.0-dev] - Phase 1 of 0.6.0, released with it
+
+### Added
+
+- **Every attempt is in the log.** `compactions.jsonl` now gets one line per decision on a marker or a wrap-up, and per scheduled, cancelled, refused, retried, finished or lost compaction, each with `event`, `reason`, `context_before` and the session id. Never the text of a message. The finished-compaction line keeps its old fields and adds `event: "compacted"` and `compaction_id`. Lines written before 0.6.0 have no `event`.
+- **Compactions the mod didn't start** (Claude Code's auto-compact, a `/compact` you type) are logged as `app_compaction`, with their `trigger`.
+- **A retry after a cancellation.** If a message or a new turn cancels a compaction during its delay, the mod tries once more after the next turn, if that turn was a short answer (at most `retry_max_tool_calls` tool calls, 3 by default), ended cleanly and nothing else came in during the delay. Not after a long turn, not after 30 minutes, not if anything compacted in between. The note to the model stays as it was.
+- **`/cc-doctor`**: a short, read-only report on the config, the log, the last week's events, rate limits, the context and anything that would stop the mod working.
+- New config key: `retry_max_tool_calls`.
+- A marked point in `register.ts` where the marker path builds a `PolicyInput` and asks a pure decision function; the stand-in, `decideStub`, does what 0.5.0 did.
+
+### Changed
+
+- **The question for a message from another session.** It now says not to compact yet: that session doesn't see the reply and nobody would give the nudge, so the model does the request, replies if the other session is waiting, and wraps up after.
+- The "not in sessions" decision no longer carries the session title.
+- The stored session state has a new shape (`state-5`), so state kept by an older version starts over.
+
+### Fixed
+
+- **`context_after` was always `null`.** It is now taken from the compaction's own `tokensAfter` when the engine reports it, or else appended as a `context_after` line, with the same `compaction_id`, at the next measurement or turn end.
+
 ## [0.5.0] - 2026-11-01
 
 The model now gets asked. The rule in `CLAUDE.md` depended on it remembering, and in the log of the first six compactions it never did.
@@ -123,3 +159,6 @@ First version, in Spanish and private.
 
 [0.5.0]: https://github.com/TrenzDev/cc-autocompact/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TrenzDev/cc-autocompact/releases/tag/v0.4.0
+[0.3.0]: https://github.com/TrenzDev/claude-context-autopilot/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/TrenzDev/claude-context-autopilot/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/TrenzDev/claude-context-autopilot/releases/tag/v0.1.0

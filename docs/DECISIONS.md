@@ -147,7 +147,9 @@ Official docs cited:
 
 **Why.** D3 leaves the judgment in the model, and that is right, but nothing reminded it. In the log of the first six compactions, none came from the model's own initiative: the user or a coordinating session asked, each time with 500k to 880k of context. D1 still stands: the task decides. What changes is that the model is asked at a moment it can answer, when a new message shows what comes next. The other gap was worse: a message from another session arrived during the 1.5 s delay, the compaction was cancelled (D7, as designed), and nothing told the model it had to ask again.
 
-**Why 400k and 100k.** Simulated over 14 days of my sessions: 140 sessions, 5,891 messages.
+**Since 0.6.0 the threshold is 200k** (the step stays 100k). The reason is the cost of compacting, which 0.5.0 didn't weigh: with the policy's figures (`plugin/hooks/policy.ts`, from replaying six months of usage with `tools/simulate.py`), from about 200k a closed task saves about twice what compacting it costs, so asking from there is worth the extra questions. The table below is 0.5.0's reasoning, kept for the record.
+
+**Why 400k and 100k (0.5.0).** Simulated over 14 days of my sessions: 140 sessions, 5,891 messages.
 
 | Threshold, step | Questions | Sessions reached | One in every N messages above it |
 | --- | --- | --- | --- |

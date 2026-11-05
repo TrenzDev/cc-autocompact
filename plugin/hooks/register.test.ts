@@ -3,6 +3,8 @@ import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 const SID = 'sid-1'
+// What a compaction leaves: at least one message
+const MSGS = [{ role: 'user' as const, text: 'Summary of the conversation so far.', toolUses: [] }]
 const APP_DIR = 'C:/app/claude-code-sessions'
 const LOG = '/home/u/.claude/cc-autocompact/pilot.jsonl'
 const INSTRUCTIONS = 'Summarize and keep what is pending.'
@@ -18,6 +20,8 @@ const CONFIG = {
   compact_instructions: INSTRUCTIONS,
   log_file: 'pilot.jsonl',
   app_sessions_dir: APP_DIR,
+  // the reminder tests were written for a 400k threshold (the default is 200k since 0.6.0)
+  reminder_tokens: 400000,
 }
 // What engine 2.1.309 answers to $.session.compact() in a headless session (the desktop app)
 const HEADLESS_REFUSAL =
@@ -41,6 +45,8 @@ type World = {
   compactFailures: number
   // /compact runs as a turn that ends before $.command.run answers
   turnInside: boolean
+  // /compact is queued and never answers
+  compactHangs: boolean
   prompts: string[]
   commands: string[]
   commandFails: boolean
@@ -53,6 +59,19 @@ type World = {
   // symbolic links: the link's path and where it leads
   links: Record<string, string>
   root: string
+  // /compact raises session.compact through the plugins (needs the engine), and what it reports as tokensAfter
+  compactEvent: boolean
+  reportAfter: number | undefined
+  // /compact leaves the live figure where it was (the app updates it on the next response)
+  keepTokens: boolean
+  // files that exist but cannot be read
+  unreadable: string[]
+  rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
+  // subagents $.agent.list() reports, and whether the call fails
+  agents: { id: string; description: string; type: string; status: string }[]
+  agentsFail: boolean
+  // another turn starts after /compact is queued and before it runs
+  overtake: boolean
 }
 
 // The engine passes Windows paths, and on Windows it puts a drive in front of /paths:
@@ -81,6 +100,7 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
     sessionCompactCalls: 0,
     compactFailures: 0,
     turnInside: false,
+    compactHangs: false,
     prompts: [],
     commands: [],
     commandFails: false,
@@ -91,6 +111,14 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
     dirs: [],
     links: {},
     root: '/proj',
+    compactEvent: false,
+    reportAfter: undefined,
+    keepTokens: false,
+    unreadable: [],
+    rateLimits: [],
+    agents: [],
+    agentsFail: false,
+    overtake: false,
     ...partial,
   }
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -114,13 +142,22 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
   // Commands the mod runs with $.command.run (compact-now is answered by the mod itself)
   on('command.run', async (_, e) => {
     if (e.command === 'compact') {
+      if (world.compactHangs) return new Promise(() => {})
       if (world.compactFailures > 0) {
         world.compactFailures -= 1
         throw new Error('the command queue is closed')
       }
       world.compactions += 1
       world.compactArgs.push(e.args)
-      world.tokens = 40_000
+      if (world.overtake && engine !== undefined) {
+        await engine.turn.start({ text: 'a message that got in first', turnId: 'tx' })
+        const r = await engine.session.compact({ trigger: 'manual', messages: MSGS, instructions: e.args })
+        if (r.skip !== undefined) return { text: `skipped: ${r.skip}` }
+      }
+      if (world.compactEvent && engine !== undefined) {
+        await engine.session.compact({ trigger: 'manual', messages: MSGS, instructions: e.args })
+      }
+      if (!world.keepTokens) world.tokens = 40_000
       if (world.turnInside && engine !== undefined) {
         await engine.turn.start({ text: `/compact ${e.args}`, turnId: 'tc' })
         await engine.turn.complete(end('', 'answer', 'tc'))
@@ -145,15 +182,22 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
           world.tokens === undefined
             ? { window: world.window }
             : { tokens: world.tokens, window: world.window, percent: 30 },
-        rateLimits: [],
+        rateLimits: world.rateLimits,
       },
     }
   })
-  // As in the desktop app: $.session.compact() always rejects
-  on('session.compact', () => {
-    world.sessionCompactCalls += 1
-    throw new Error(HEADLESS_REFUSAL)
+  // As in the desktop app: $.session.compact() always rejects. Any other compaction (a /compact, the app's
+  // auto-compact) stands, with the figures the engine recorded.
+  on('session.compact', (_, e) => {
+    if (e.trigger === 'plugin') {
+      world.sessionCompactCalls += 1
+      throw new Error(HEADLESS_REFUSAL)
+    }
+
+    return { messages: MSGS, tokensBefore: world.tokens, ...(world.reportAfter !== undefined && { tokensAfter: world.reportAfter }) }
   })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('tool.call', () => ({ result: 'ok' }) as never)
   on('ui.toast', (_, e) => {
     world.toasts.push(e.text)
 
@@ -161,13 +205,31 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
   })
   on('fs.list', (_, e) => {
     const p = norm(e.path)
+    // The mod's own folders: what the test wrote under them
+    if (/\/cc-autocompact\/(events|savings)(\/|$)/.test(p)) {
+      const names = Object.keys(world.written)
+        .filter(f => f.startsWith(`${p}/`) && !f.slice(p.length + 1).includes('/'))
+        .map(f => f.slice(p.length + 1))
+
+      return { value: names.map(name => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })) }
+    }
     if (p.endsWith('/Claude-Data')) return { value: [{ name: 'claude_x', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }
     if (p === APP_DIR || p.endsWith('/claude-code-sessions')) return { value: [{ name: 'account', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }
     if (p.endsWith('/claude-code-sessions/account')) return { value: [{ name: 'org', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }
 
     return { value: [{ name: 'local_a.json', kind: 'file', size: 10, mtimeMs: 5, isLink: false }] }
   })
-  on('fs.exists', (_, e) => ({ value: norm(e.path) in world.written || world.dirs.includes(norm(e.path)) }))
+  on('fs.exists', (_, e) => {
+    const p = norm(e.path)
+    const isModDir = /\/cc-autocompact\/(events|savings)\//.test(`${p}/`) && Object.keys(world.written).some(f => f.startsWith(`${p}/`))
+
+    return { value: p in world.written || world.dirs.includes(p) || isModDir }
+  })
+  on('agent.list', () => {
+    if (world.agentsFail) throw new Error('agent list unavailable')
+
+    return { value: world.agents as never }
+  })
   on('fs.read', (_, e) => {
     const p = norm(e.path)
     if (p.endsWith('cc-autocompact/config.json')) {
@@ -175,6 +237,7 @@ const mount = (on: On, partial: Partial<World> = {}, engine?: Engine) => {
 
       return { value: typeof world.config === 'string' ? world.config : JSON.stringify(world.config) }
     }
+    if (world.unreadable.includes(p)) return { deny: 'EACCES: permission denied' }
     if (!(p in world.written) && !p.endsWith('local_a.json')) return { deny: 'ENOENT: no such file' }
     if (p.endsWith('local_a.json')) return { value: JSON.stringify({ cliSessionId: SID, title: world.title }) }
 
@@ -217,6 +280,8 @@ const lines = (text: string | undefined) =>
     .split('\n')
     .filter(l => l !== '')
     .map(l => JSON.parse(l))
+// Only the finished compactions of the log (since 0.6.0 it also holds decisions, cancellations and the rest)
+const compacted = (text: string | undefined) => lines(text).filter(l => l.event === 'compacted')
 const debugOf = (world: World) => lines(Object.entries(world.written).find(([p]) => p.endsWith('debug.jsonl'))?.[1])
 
 test('in the app $.session.compact always rejects: the mod queues /compact instead and logs it', async ($, on) => {
@@ -230,7 +295,7 @@ test('in the app $.session.compact always rejects: the mod queues /compact inste
   expect(world.compactions).toBe(1)
   expect(world.compactArgs[0]).toBe(INSTRUCTIONS)
   expect(world.toasts.some(t => t.includes('Compacted: 300k to 40k'))).toBe(true)
-  const [line] = lines(world.written[LOG])
+  const [line] = compacted(world.written[LOG])
   expect(line.trigger).toBe('task_done')
   expect(line.session).toBe('Project · Backend')
   expect(line.context_before).toBe(300_000)
@@ -298,7 +363,7 @@ test('no config.json: the defaults compact every session and log to <claude dir>
   await clock.advance(1600)
   expect(world.compactions).toBe(1)
   expect(world.compactArgs[0]).toContain("the user's decisions")
-  const log = lines(world.written['/home/u/.claude/cc-autocompact/compactions.jsonl'])
+  const log = compacted(world.written['/home/u/.claude/cc-autocompact/compactions.jsonl'])
   expect(log.length).toBe(1)
   expect(log[0].session).toBe(null)
   expect(log[0].trigger).toBe('task_done')
@@ -384,7 +449,7 @@ test('if /compact ends its turn before command.run answers, it is logged once', 
   await $.turn.complete(end(WRAP))
   await clock.advance(1600)
   expect(world.compactions).toBe(1)
-  const log = lines(world.written[LOG])
+  const log = compacted(world.written[LOG])
   expect(log.length).toBe(1)
   expect(log[0].context_after).toBe(40_000)
   // The /compact turn end closed it; command.run's answer came later and added nothing
@@ -413,7 +478,7 @@ test('refused three times: no compaction, a toast with the reason, and free for 
   await clock.advance(3100)
   expect(world.compactions).toBe(0)
   expect(world.toasts.some(t => t.startsWith('Could not queue /compact: '))).toBe(true)
-  expect(world.written[LOG]).toBe(undefined)
+  expect(compacted(world.written[LOG])).toEqual([])
   await $.turn.start({ text: 'go on', turnId: 't2' })
   await $.turn.complete(end(WRAP, 'answer', 't2'))
   await clock.advance(1600)
@@ -934,7 +999,10 @@ test('config: numbers out of range are capped (delay at 60 s, handoff at 50,000 
 const ALL_SESSIONS = { ...CONFIG, sessions: ['*'] }
 const QUESTION_512K =
   '[cc-autocompact] Context is at 512k. This is a question, not an order: is the task closed, and does what comes next not need this context?\n' +
-  'If yes: answer this message if it is short; if it asks for something long, leave it as the next step and say you will need a nudge after compacting. Wrap up (the wrap-up skill, unless your instructions name another) and end with the exact line "Ready to compact.".\n' +
+  'If yes: answer this message if it is short; if it asks for something long and comes from the user, leave it as the next step and say you will need a nudge after compacting. ' +
+  "If it comes from another session, don't compact yet: that session doesn't see your reply and nobody would give you the nudge, so do what it asks and wrap up when that is done. " +
+  'If another session is waiting for a reply, send it before you wrap up. ' +
+  'Wrap up (the wrap-up skill, unless your instructions name another) and end with the exact line "Ready to compact.".\n' +
   "If no (a task in progress, a long document, a batch, the user iterating), or you aren't sure: carry on and don't mention this. Using the whole context window is fine when the task needs it."
 const CANCELLED_512K =
   '[cc-autocompact] The compaction you asked for was cancelled because a message came in (context is at 512k). ' +
@@ -1217,7 +1285,8 @@ test('threshold and step change in config.json; a value that is not a number tak
   world.config = { ...ALL_SESSIONS, reminder_tokens: 'lots', reminder_every_tokens: -5 }
   world.tokens = undefined
   await say($)
-  world.tokens = 399_000
+  // The defaults: 200k (since 0.6.0) and 100k
+  world.tokens = 199_000
   await say($)
   expect(notes(world)).toEqual([])
   world.tokens = 512_000
@@ -1264,7 +1333,8 @@ test('security: the reminder and the note are fixed text plus a figure, whatever
 })
 
 test('security: the reminder never compacts by itself, however big the context is', async ($, on) => {
-  const { world, clock } = mount(on, { tokens: 990_000, config: ALL_SESSIONS })
+  // hard_cap_share 1: the window-nearly-full rule (a separate, explicit size rule since 0.6.0) stays out of this test
+  const { world, clock } = mount(on, { tokens: 990_000, config: { ...ALL_SESSIONS, hard_cap_share: 1 } })
   await $.session.start(START)
   await say($)
   expect(notes(world).length).toBe(1)
@@ -1273,4 +1343,838 @@ test('security: the reminder never compacts by itself, however big the context i
   await clock.advance(60_000)
   expect(world.compactions).toBe(0)
   expect(world.commands).toEqual([])
+})
+
+// ─── 0.6.0: cross-session question, the full log, context_after, app compactions, retry, /cc-doctor ───
+
+// Since 0.6.0 frequent events go to this session's own file; the shared log keeps compactions. Both, by time.
+const EVENTS = '/home/u/.claude/cc-autocompact/events/1970-01/sid-1.jsonl'
+// Every line is in the session's own file; the shared log repeats the rare ones, and keeps lines older than 0.6.0
+const allLines = (world: World, path = LOG) =>
+  [...lines(world.written[EVENTS]), ...lines(world.written[path]).filter(l => l.event === undefined)].sort(
+    (a, b) => Date.parse(a.time) - Date.parse(b.time),
+  )
+const events = (world: World, path = LOG) => allLines(world, path).map(l => l.event as string)
+const ofEvent = (world: World, event: string, path = LOG) => allLines(world, path).filter(l => l.event === event)
+const measure = (engine: Engine, tokens: number, window = 1_000_000) =>
+  engine.session.measure({ context: { tokens, window }, rateLimits: [], changed: ['context'] })
+const toolCalls = async (engine: Engine, n: number, agentId?: string) => {
+  for (let i = 0; i < n; i++) await engine.tool.call({ tool: 'Bash', command: 'ls', ...(agentId !== undefined && { agentId }) } as never)
+}
+
+test('reminder, another session: the question says not to compact yet, to do the request and to reply before closing', async ($, on) => {
+  const { world } = mount(on, { tokens: 512_000 })
+  await $.session.start(START)
+  await say($, 'please run the migration', 'peer')
+  const [q] = notes(world)
+  expect(q).toContain("If it comes from another session, don't compact yet")
+  expect(q).toContain('nobody would give you the nudge, so do what it asks and wrap up when that is done')
+  expect(q).toContain('If another session is waiting for a reply, send it before you wrap up')
+  expect(q).toContain('comes from the user, leave it as the next step')
+  expect(q).not.toContain('migration')
+})
+
+test('log: a marker turn leaves decision, scheduled and compacted lines; a plain turn leaves none', async ($, on) => {
+  const { world, clock } = mount(on)
+  await $.session.start(START)
+  await $.turn.start({ text: 'hi', turnId: 't0' })
+  await $.turn.complete(end('Done, moving on.', 'answer', 't0'))
+  expect(world.written[LOG]).toBe(undefined)
+  expect(world.written[EVENTS]).toBe(undefined)
+  await $.turn.start({ text: 'wrap up', turnId: 't1' })
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(events(world)).toEqual(['decision', 'scheduled', 'compacted'])
+  const [decision, scheduled, done] = allLines(world)
+  expect(decision).toMatchObject({ event: 'decision', action: 'compact', context_before: 300_000, session_id: SID, trigger: 'task_done' })
+  expect(decision.reason).toContain('task closed at 300k')
+  expect(typeof decision.cost).toBe('number')
+  expect(decision.saving > decision.cost).toBe(true)
+  expect(scheduled).toMatchObject({ event: 'scheduled', context_before: 300_000, trigger: 'task_done', delay_ms: 1500 })
+  // The shared log holds only the compaction
+  expect(lines(world.written[LOG]).map(l => l.event)).toEqual(['compacted'])
+  // The line older readers know, plus event and compaction_id
+  for (const key of ['time', 'session', 'session_id', 'context_before', 'context_after', 'trigger']) expect(key in done).toBe(true)
+  expect(done).toMatchObject({ event: 'compacted', session: 'Project · Backend', context_before: 300_000, context_after: 40_000, trigger: 'task_done' })
+  expect(typeof done.compaction_id).toBe('string')
+  expect(done.compaction_id.length > 0).toBe(true)
+})
+
+test('log: a refused decision says why (under the floor, outside the list, switched off), always with the session id', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 60_000 })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  // The title is read again once its 30 min cache is over
+  world.title = 'Personal notes'
+  world.tokens = 300_000
+  await clock.advance(31 * 60_000)
+  await $.turn.start({ text: 'go on', turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  world.config = { ...CONFIG, enabled: false }
+  await $.turn.start({ text: 'go on', turnId: 't3' })
+  await $.turn.complete(end(WRAP, 'answer', 't3'))
+  const d = ofEvent(world, 'decision')
+  expect(d.map(l => l.reason)).toEqual([
+    'under the floor (60k < 80k)',
+    'this session is not in sessions',
+    'enabled is false in config.json',
+  ])
+  expect(d[0].context_before).toBe(60_000)
+  expect(d.every(l => l.session_id === SID)).toBe(true)
+})
+
+test('log: a cancellation by a message records its origin and never its text; by a turn it says so', async ($, on) => {
+  const SECRET = 'my private message text'
+  const { world, clock } = mount(on, { config: { ...CONFIG, retry_max_tool_calls: 0 } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, SECRET, 'peer')
+  await clock.advance(2000)
+  const [c] = ofEvent(world, 'cancelled')
+  expect(c).toMatchObject({ reason: 'message', origin: 'peer', trigger: 'task_done', context_before: 300_000 })
+  expect(ofEvent(world, 'cancelled').length).toBe(1)
+  // A new turn during the delay
+  await $.turn.start({ text: SECRET, turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  await $.turn.start({ text: SECRET, turnId: 't3' })
+  await clock.advance(1600)
+  expect(ofEvent(world, 'cancelled').map(l => l.reason)).toEqual(['message', 'new turn'])
+  expect(JSON.stringify(world.written)).not.toContain('private')
+})
+
+test('log: a refusal is logged with the engine reason and whether it retries, under the same compaction id', async ($, on) => {
+  const { world, clock } = mount(on, { compactFailures: 1 })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  await clock.advance(3100)
+  const [r] = ofEvent(world, 'refused')
+  expect(r).toMatchObject({ will_retry: true, attempt: 1, context_before: 300_000, trigger: 'task_done' })
+  // The engine's own words (the test engine words a failed command as "no implementation for command.run")
+  expect(typeof r.reason === 'string' && r.reason.length > 0).toBe(true)
+  expect(ofEvent(world, 'compacted').length).toBe(1)
+  // Same compaction id across the retry and the result
+  expect(ofEvent(world, 'compacted')[0].compaction_id).toBe(r.compaction_id)
+})
+
+test('log: a /compact that gives no sign in 10 min is logged as lost', async ($, on) => {
+  // command.run never answers: the /compact is queued and nothing comes back
+  const { world, clock } = mount(on, { compactHangs: true })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  await clock.advance(11 * 60_000)
+  await $.turn.start({ text: 'hello', turnId: 't2' })
+  await $.turn.complete(end('Hi.', 'answer', 't2'))
+  const [lost] = ofEvent(world, 'lost')
+  expect(lost).toMatchObject({ reason: 'no sign in 10 min', trigger: 'task_done', context_before: 300_000 })
+})
+
+test('log: if the log exists and cannot be read, nothing is written (history is never clobbered)', async ($, on) => {
+  const { world, clock } = mount(on, { written: { [LOG]: '{"old":1}\n' }, unreadable: [LOG] })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+  expect(world.written[LOG]).toBe('{"old":1}\n')
+  // The session's own file has it, and says why the shared one was left alone
+  expect(ofEvent(world, 'compacted').length).toBe(1)
+  expect(ofEvent(world, 'error').some(l => l.reason.includes('not written: unreadable'))).toBe(true)
+})
+
+test('log: lines are appended to what was there before', async ($, on) => {
+  const OLD = '{"time":"2026-10-31T14:20:05.123Z","session":null,"session_id":"x","context_before":1,"context_after":null,"trigger":"task_done"}'
+  const { world, clock } = mount(on, { written: { [LOG]: `${OLD}\n` } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(world.written[LOG].startsWith(`${OLD}\n`)).toBe(true)
+  expect(lines(world.written[LOG]).map(l => l.event)).toEqual([undefined, 'compacted'] as never)
+})
+
+test('context_after: the tokensAfter the compaction reports wins over the live figure', async ($, on) => {
+  const { world, clock } = mount(on, { compactEvent: true, reportAfter: 35_000, keepTokens: true }, $)
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  const [done] = ofEvent(world, 'compacted')
+  expect(done.context_after).toBe(35_000)
+  expect(world.toasts.some(t => t.includes('Compacted: 300k to 35k'))).toBe(true)
+  // The mod's own compaction is not an app compaction
+  expect(ofEvent(world, 'app_compaction')).toEqual([])
+  expect(ofEvent(world, 'context_after')).toEqual([])
+})
+
+test('context_after: unknown at the time, it comes in a line of its own at the next measurement', async ($, on) => {
+  const { world, clock } = mount(on, { compactEvent: true, keepTokens: true }, $)
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  const [done] = ofEvent(world, 'compacted')
+  expect(done.context_after).toBe(null)
+  // A figure that has not dropped is the old context: ignored
+  await measure($, 300_000)
+  expect(ofEvent(world, 'context_after')).toEqual([])
+  await measure($, 42_000)
+  await measure($, 45_000)
+  const after = ofEvent(world, 'context_after')
+  expect(after.length).toBe(1)
+  expect(after[0]).toMatchObject({ compaction_id: done.compaction_id, context_after: 42_000, session_id: SID })
+  // The compacted line is never rewritten
+  expect(ofEvent(world, 'compacted')[0].context_after).toBe(null)
+})
+
+test('context_after: with no measurement, the next main-thread turn end fills it', async ($, on) => {
+  const { world, clock } = mount(on, { keepTokens: true })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(ofEvent(world, 'compacted')[0].context_after).toBe(null)
+  world.tokens = 50_000
+  // A subagent's end does not count
+  await $.turn.complete({ ...end('Done.', 'answer', 'ts'), agentId: 'sub-1' })
+  expect(ofEvent(world, 'context_after')).toEqual([])
+  await $.turn.start({ text: 'next', turnId: 't2' })
+  await $.turn.complete(end('Hi.', 'answer', 't2'))
+  expect(ofEvent(world, 'context_after')[0].context_after).toBe(50_000)
+})
+
+test('app_compaction: an auto-compact or a typed /compact is logged with its trigger; precompute and subagents are not', async ($, on) => {
+  const { world } = mount(on, { reportAfter: 60_000 })
+  await $.session.start(START)
+  await $.session.compact({ trigger: 'auto', messages: MSGS })
+  await $.session.compact({ trigger: 'manual', messages: MSGS, instructions: 'keep it short' })
+  await $.session.compact({ trigger: 'precompute', messages: MSGS })
+  await $.session.compact({ trigger: 'auto', messages: MSGS, agentId: 'sub-1' })
+  const apps = ofEvent(world, 'app_compaction')
+  expect(apps.map(l => l.trigger)).toEqual(['auto', 'manual'])
+  expect(apps[0]).toMatchObject({ context_before: 300_000, context_after: 60_000, session_id: SID })
+  expect(world.written[LOG]).not.toContain('keep it short')
+  expect(ofEvent(world, 'compacted')).toEqual([])
+})
+
+test('app_compaction: without tokensAfter, the next measurement fills it; and it stops a scheduled compaction', async ($, on) => {
+  const { world, clock } = mount(on)
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await $.session.compact({ trigger: 'auto', messages: MSGS })
+  await clock.advance(2000)
+  // Compacted already: the mod's own does not run on top
+  expect(world.compactions).toBe(0)
+  const [app] = ofEvent(world, 'app_compaction')
+  expect(app.context_after).toBe(null)
+  await measure($, 70_000)
+  expect(ofEvent(world, 'context_after')[0]).toMatchObject({ compaction_id: app.compaction_id, context_after: 70_000 })
+})
+
+test('retry: a compaction a message cancelled runs again after a short answer, with trigger retry', async ($, on) => {
+  // reminder false: no note reaches the model, so the retry is the only way back (with the note, see H1 below)
+  const { world, clock } = mount(on, { tokens: 512_000, config: { ...ALL_SESSIONS, reminder: false } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'quick question', 'peer')
+  await clock.advance(2000)
+  expect(world.compactions).toBe(0)
+  await $.turn.start({ text: 'quick question', turnId: 't2' })
+  await toolCalls($, 2)
+  // A subagent's tool calls are not the main thread's
+  await toolCalls($, 10, 'sub-1')
+  await $.turn.complete(end('The answer is 4.', 'answer', 't2'))
+  expect(world.compactions).toBe(0)
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+  const [done] = ofEvent(world, 'compacted')
+  expect(done.trigger).toBe('retry')
+  expect(ofEvent(world, 'retry').map(l => l.reason)).toEqual(['scheduled'])
+  expect(ofEvent(world, 'retry')[0].tool_calls).toBe(2)
+  expect(ofEvent(world, 'scheduled').map(l => l.trigger)).toEqual(['task_done', 'retry'])
+})
+
+test('retry: a long turn is new work, so no retry; the note to the model stays', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 512_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  // Cancelled by a turn, not a message: the model has not been told yet
+  await $.turn.start({ text: 'already queued', turnId: 't2' })
+  await toolCalls($, 4)
+  await $.turn.complete(end('Built the feature.', 'answer', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry')[0]).toMatchObject({ reason: 'not retried: long turn (4 tool calls)', tool_calls: 4 })
+  await say($)
+  expect(notes(world)).toEqual([CANCELLED_512K])
+  // The debt is gone: a short turn later does not bring it back
+  await $.turn.start({ text: 'hello', turnId: 't3' })
+  await $.turn.complete(end('Hi.', 'answer', 't3'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+})
+
+test('retry: never after an aborted or failed turn', async ($, on) => {
+  const { world, clock } = mount(on, { config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'stop')
+  await clock.advance(2000)
+  await $.turn.start({ text: 'stop', turnId: 't2' })
+  await $.turn.complete(end('', 'aborted', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry')[0].reason).toBe('not retried: turn ended with reason aborted')
+})
+
+test('retry: a message during the retry delay cancels it, and it is not owed again', async ($, on) => {
+  const { world, clock } = mount(on, { config: { ...ALL_SESSIONS, reminder: false } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'one')
+  await clock.advance(2000)
+  await $.turn.start({ text: 'one', turnId: 't2' })
+  await $.turn.complete(end('Sure.', 'answer', 't2'))
+  await clock.advance(500)
+  await say($, 'two')
+  await clock.advance(2000)
+  await $.turn.start({ text: 'two', turnId: 't3' })
+  await $.turn.complete(end('Sure.', 'answer', 't3'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry').length).toBe(1)
+  expect(ofEvent(world, 'cancelled').map(l => l.trigger)).toEqual(['task_done', 'retry'])
+})
+
+test('retry: not if a compaction happened meanwhile, and not after 30 min', async ($, on) => {
+  const { world, clock } = mount(on, { config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'one')
+  await clock.advance(2000)
+  await $.turn.start({ text: 'one', turnId: 't2' })
+  await $.session.compact({ trigger: 'auto', messages: MSGS })
+  await $.turn.complete(end('Sure.', 'answer', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+
+  world.tokens = 300_000
+  await $.turn.start({ text: 'go on', turnId: 't3' })
+  await $.turn.complete(end(WRAP, 'answer', 't3'))
+  await clock.advance(500)
+  await say($, 'two')
+  await clock.advance(31 * 60_000)
+  await $.turn.start({ text: 'two', turnId: 't4' })
+  await $.turn.complete(end('Sure.', 'answer', 't4'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry').map(l => l.reason)).toEqual(['not retried: retry expired'])
+})
+
+test('retry: retry_max_tool_calls sets what a short turn is', async ($, on) => {
+  const { world, clock } = mount(on, { config: { ...ALL_SESSIONS, retry_max_tool_calls: 0 } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'one')
+  await clock.advance(2000)
+  await $.turn.start({ text: 'one', turnId: 't2' })
+  await toolCalls($, 1)
+  await $.turn.complete(end('Sure.', 'answer', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry')[0].reason).toBe('not retried: long turn (1 tool calls)')
+})
+
+test('policy input: the marker path builds it from the moment, with rate limits and the last call time', async ($, on) => {
+  const { world, clock } = mount(on, {
+    config: { ...CONFIG, debug: true },
+    rateLimits: [
+      { kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-11-04T20:00:00Z' },
+      { kind: 'seven_day', percentUsed: 7 },
+    ],
+  })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  const policy = debugOf(world).find(l => l.event === 'policy')
+  expect(policy.action).toBe('compact')
+  expect(policy.input).toMatchObject({
+    now: 1_000_000,
+    contextTokens: 300_000,
+    windowTokens: 1_000_000,
+    lastCallAt: 1_000_000,
+    taskClosed: true,
+    turnRunning: false,
+    justCompacted: false,
+    cacheTtlMs: 3_600_000,
+    fiveHour: { pct: 23.5, resetsAt: Date.parse('2026-11-04T20:00:00Z') },
+    sevenDay: { pct: 7, resetsAt: null },
+    trigger: 'turn_end',
+  })
+  expect(world.compactions).toBe(1)
+})
+
+test('/cc-doctor: config, log, recent events, rate limits, context and warnings, in plain text', async ($, on) => {
+  const { world, clock } = mount(on, {
+    config: { ...CONFIG, sessions: ['*'], delay_ms: 2000, typo_key: 1 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 41 }],
+  })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(2100)
+  const before = JSON.stringify(world.written)
+  const out = (await $.command.run({ command: 'cc-doctor' })).text
+  // Read-only
+  expect(JSON.stringify(world.written)).toBe(before)
+  expect(out).toContain('cc-autocompact doctor')
+  expect(out).toContain('config.json valid; differs from defaults: ')
+  expect(out).toContain('delay_ms')
+  expect(out).toContain('compact_instructions')
+  expect(out).not.toContain('sessions,')
+  expect(out).toContain('keys the mod does not know: typo_key')
+  expect(out).toContain(`Log: ${LOG} (readable; new lines are appended)`)
+  expect(out).toContain('Last 7 days: 3 events')
+  expect(out).toContain('compacted (command.run) 1')
+  expect(out).toContain('decision (task closed at 300k: saves')
+  expect(out).toContain('Rate limits: five_hour 41%')
+  expect(out).toContain('Context: 40k of 1.0M')
+  expect(out).not.toContain(INSTRUCTIONS)
+})
+
+test('/cc-doctor: no config, no log, no rate limits, no figure, and a broken config is a warning', async ($, on) => {
+  const { world } = mount(on, { config: null, tokens: undefined })
+  await $.session.start(START)
+  let out = (await $.command.run({ command: 'cc-doctor' })).text
+  expect(out).toContain('not found, running on the defaults')
+  expect(out).toContain('not created yet')
+  expect(out).toContain('Last 7 days: no events')
+  expect(out).toContain('Rate limits: no live usage reading; pacing off; savings are estimated')
+  expect(out).toContain('This week: nothing recorded yet')
+  expect(out).toContain('Last weekly line: none yet')
+  expect(out).toMatch(/pays from about \d+k of context \(default prices\)/)
+  expect(out).toContain('Context: no figure yet')
+  expect(out).toContain('Warnings: none')
+  world.config = '{ "enabled": false, '
+  out = (await $.command.run({ command: 'cc-doctor' })).text
+  expect(out).toContain('is NOT valid JSON')
+  expect(out).toContain('automatic compaction is off until it is fixed')
+})
+
+// ─── 0.6.0 phase 2: the policy, idle, pacing, savings, the shrink guard ───
+
+const IDLE = 45 * 60_000
+const DATA = '/home/u/.claude/cc-autocompact'
+const iso = (ms: number) => new Date(ms).toISOString()
+
+test('policy: a closed task under the break-even does not compact, and the log says why with the figures', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 120_000 })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  const [d] = ofEvent(world, 'decision')
+  expect(d.action).toBe('none')
+  expect(d.reason).toContain('does not pay at 120k')
+  expect(d.saving < d.cost).toBe(true)
+})
+
+test('policy: the window nearly full compacts at a turn end without the marker (hard_cap), never on a message', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 900_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await say($, 'hello', 'peer')
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  await $.turn.start({ text: 'hello', turnId: 't1' })
+  await $.turn.complete(end('Still working.'))
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+  expect(ofEvent(world, 'compacted')[0].trigger).toBe('hard_cap')
+  expect(ofEvent(world, 'decision')[0].reason).toContain('window nearly full')
+})
+
+test('idle: a closed task that did not compact compacts after idle_minutes', async ($, on) => {
+  // The marker turn's compaction is refused three times, so the task stays closed and uncompacted
+  const { world, clock } = mount(on, { compactFailures: 3, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  await clock.advance(3100)
+  await clock.advance(3100)
+  expect(world.compactions).toBe(0)
+  await clock.advance(IDLE - 7000)
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+  expect(ofEvent(world, 'compacted')[0].trigger).toBe('idle')
+})
+
+test('idle mid-task: asks once; an answer with the marker compacts (idle_ask)', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 400_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end('Half way there.'))
+  await clock.advance(IDLE + 1000)
+  const asked = world.prompts.filter(p => p.startsWith('[cc-autocompact] This session has been idle'))
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toContain('400k of context')
+  expect(asked[0]).toContain('the exact line "Ready to compact."')
+  expect(world.compactions).toBe(0)
+  await $.turn.start({ text: asked[0], turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+  expect(ofEvent(world, 'compacted')[0].trigger).toBe('idle_ask')
+})
+
+test('idle mid-task: an answer without the marker does not compact, and it is not asked again until someone else speaks', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 400_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end('Half way there.'))
+  await clock.advance(IDLE + 1000)
+  const q = world.prompts.find(p => p.startsWith('[cc-autocompact] This session has been idle')) ?? ''
+  await $.turn.start({ text: q, turnId: 't2' })
+  await $.turn.complete(end('A subagent still owes a result.', 'answer', 't2'))
+  await clock.advance(IDLE + 1000)
+  expect(world.compactions).toBe(0)
+  expect(world.prompts.filter(p => p.startsWith('[cc-autocompact] This session has been idle')).length).toBe(1)
+  expect(ofEvent(world, 'idle_declined').length).toBe(1)
+  // Someone else's turn: it may ask again after the next idle stretch
+  await $.turn.start({ text: 'carry on', turnId: 't3' })
+  await $.turn.complete(end('Done a bit more.', 'answer', 't3'))
+  await clock.advance(IDLE + 1000)
+  expect(world.prompts.filter(p => p.startsWith('[cc-autocompact] This session has been idle')).length).toBe(2)
+})
+
+test('idle: a message during the idle wait cancels it; a running subagent makes it wait; never for subagent turns', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 400_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete({ ...end(WRAP, 'answer', 'ts'), agentId: 'sub-1' })
+  await clock.advance(IDLE + 1000)
+  expect(world.prompts).toEqual([])
+  await $.turn.complete(end('Half way there.'))
+  await clock.advance(30 * 60_000)
+  await say($, 'one more thing')
+  await clock.advance(20 * 60_000)
+  expect(world.prompts.filter(p => p.includes('has been idle'))).toEqual([])
+  expect(world.compactions).toBe(0)
+})
+
+test('idle: background work still running makes a closed task wait instead of compacting', async ($, on) => {
+  const { world, clock } = mount(on, {
+    config: ALL_SESSIONS,
+    agents: [{ id: 'a1', description: 'tests', type: 'general-purpose', status: 'running' }],
+  })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'decision')[0]).toMatchObject({ action: 'wait', reason: 'background work still running' })
+  // When it has finished, the re-check compacts
+  world.agents = []
+  await clock.advance(5 * 60_000)
+  await clock.advance(1600)
+  expect(world.compactions).toBe(1)
+})
+
+test('pacing: a note on a message from another session at 90%; none on a person at 99%; none under the thresholds', async ($, on) => {
+  const { world } = mount(on, { tokens: 50_000, rateLimits: [{ kind: 'five_hour', percentUsed: 90 }] })
+  await $.session.start(START)
+  await say($, 'run the batch', 'peer')
+  expect(notes(world).some(n => n.includes('The 5-hour usage limit is at 90%'))).toBe(true)
+  expect(notes(world).some(n => n.includes('did not come from a person'))).toBe(true)
+  world.rateLimits = [{ kind: 'five_hour', percentUsed: 99 }, { kind: 'seven_day', percentUsed: 99 }]
+  for (const kind of ['sdk', 'composer', 'bridge', 'channel']) {
+    const before = world.entries.length
+    await $.prompt.submit({ text: `from ${kind}`, wait: false, origin: { kind } } as never)
+    // It enters at once, as typed, with nothing beside it
+    expect(world.entries.length).toBe(before + 1)
+    expect(world.entries.at(-1)).toEqual({ text: `from ${kind}`, context: [] })
+  }
+  world.rateLimits = [{ kind: 'five_hour', percentUsed: 50 }, { kind: 'seven_day', percentUsed: 60 }]
+  await say($, 'run the batch', 'peer')
+  expect(notes(world)).toEqual([])
+  expect(ofEvent(world, 'pace').map(l => [l.origin, l.level, l.pct])).toEqual([['peer', 'light', 90]])
+})
+
+test('pacing: the resume prompt goes once after the reset, only if work was deferred; pacing false says nothing', async ($, on) => {
+  const resetsAt = 1_000_000 + 10 * 60_000
+  const { world, clock } = mount(on, { tokens: 50_000, rateLimits: [{ kind: 'five_hour', percentUsed: 96, resetsAt: iso(resetsAt) }] })
+  await $.session.start(START)
+  await clock.advance(15 * 60_000)
+  expect(world.prompts.some(p => p.includes('usage limit has reset'))).toBe(false)
+  await say($, 'run the batch', 'peer')
+  expect(notes(world).some(n => n.includes('Do not start new work for it now'))).toBe(true)
+  // The reset time has passed already: the resume comes a little later, once
+  await clock.advance(5000)
+  await clock.advance(5 * 60_000)
+  expect(world.prompts.filter(p => p.includes('The 5-hour usage limit has reset')).length).toBe(1)
+  world.config = { ...CONFIG, pacing: false }
+  await say($, 'again', 'peer')
+  expect(notes(world)).toEqual([])
+})
+
+test('savings: each session writes its own week file, and last week is summed into weekly.log once', async ($, on) => {
+  const LAST = `${DATA}/savings/1969-12-22`
+  const { world, clock } = mount(on, {
+    config: { ...CONFIG, sessions: ['*'], usd_per_point: 2 },
+    written: {
+      [`${LAST}/other-a.json`]: JSON.stringify({ saved: 30, spent: 4, compactions: 3, failed: 0 }),
+      [`${LAST}/other-b.json`]: JSON.stringify({ saved: 10, spent: 2, compactions: 1, failed: 1 }),
+    },
+  })
+  await $.session.start(START)
+  await $.session.start(START)
+  const weekly = (world.written[`${DATA}/weekly.log`] ?? '').split('\n').filter(l => l !== '')
+  expect(weekly.length).toBe(1)
+  expect(weekly[0]).toContain('week from 1969-12-22: 4 compactions, estimated net saving $34 (17.0 points)')
+  expect(weekly[0]).toContain('1 did not go through')
+  expect(world.toasts.filter(t => t.includes('week from 1969-12-22')).length).toBe(1)
+  // This week: a compaction 300k to 40k, then a request
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  await $.turn.start({ text: 'next', turnId: 't2' })
+  await $.turn.complete(end('Hi.', 'answer', 't2'))
+  const mine = JSON.parse(world.written[`${DATA}/savings/1969-12-29/sid-1.json`])
+  expect(mine.compactions).toBe(1)
+  expect(mine.spent > 0).toBe(true)
+  expect(mine.saved > 0).toBe(true)
+})
+
+test('log: compactions.jsonl is never shrunk: shorter than this session last saw it, nothing is written and an error is logged', async ($, on) => {
+  const { world, clock } = mount(on, { config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(lines(world.written[LOG]).length).toBe(1)
+  // Another writer lost lines (or a read came back cut)
+  world.written[LOG] = '{"x":1}\n'
+  world.tokens = 300_000
+  await $.turn.start({ text: 'go on', turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  await clock.advance(1600)
+  expect(world.compactions).toBe(2)
+  expect(world.written[LOG]).toBe('{"x":1}\n')
+  expect(ofEvent(world, 'error').some(l => l.reason.includes('shorter than this session last saw it'))).toBe(true)
+})
+
+test('fail open: a failure in the idle check or in pacing does nothing but leave an error line', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 400_000, config: ALL_SESSIONS, rateLimits: [{ kind: 'five_hour', percentUsed: 96 }] })
+  await $.session.start(START)
+  await $.turn.complete(end('Half way there.'))
+  world.usageFails = true
+  await clock.advance(IDLE + 1000)
+  expect(world.prompts).toEqual([])
+  expect(world.compactions).toBe(0)
+  await say($, 'from another session', 'peer')
+  expect(world.entries.at(-1)?.text).toBe('from another session')
+  const errors = ofEvent(world, 'error').map(l => l.reason)
+  expect(errors.some(r => r.startsWith('policy (idle): '))).toBe(true)
+  expect(errors.some(r => r.startsWith('pace: '))).toBe(true)
+})
+
+// ─── 0.6.0 phase 3: the adversarial review ───
+
+test('H1: the model was told of the cancellation and ended without the marker: no retry', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 512_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'one more thing', 'peer')
+  expect(notes(world)).toEqual([CANCELLED_512K])
+  await clock.advance(2000)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await $.turn.complete(end('Done, and I keep going.', 'answer', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry')[0].reason).toBe('not retried: the model was told and did not close')
+})
+
+test('H1: a retry goes through the policy: one that no longer pays is dropped', async ($, on) => {
+  const { world, clock } = mount(on, { config: { ...ALL_SESSIONS, reminder: false } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(500)
+  await say($, 'one')
+  await clock.advance(2000)
+  world.tokens = 120_000
+  await $.turn.start({ text: 'one', turnId: 't2' })
+  await $.turn.complete(end('Sure.', 'answer', 't2'))
+  await clock.advance(5000)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'retry')[0].reason).toContain('not retried: policy: does not pay')
+})
+
+test('H2: a turn that gets in before the queued /compact skips it: no compaction, no "compacted" line, a retry owed', async ($, on) => {
+  const { world, clock } = mount(on, { overtake: true, config: ALL_SESSIONS }, $)
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(ofEvent(world, 'compacted')).toEqual([])
+  expect(ofEvent(world, 'cancelled')[0]).toMatchObject({ reason: 'overtaken', trigger: 'task_done', context_before: 300_000 })
+  expect(world.tokens).toBe(300_000)
+  // The turn that got in is not taken for the compaction turn
+  await $.turn.complete(end('Hi.', 'answer', 'tx'))
+  expect(ofEvent(world, 'compacted')).toEqual([])
+  expect(Object.keys(world.written).some(p => p.includes('/savings/'))).toBe(false)
+})
+
+test('H3: the policy gets the context the last compaction left; hard_cap_share cannot go under 0.5', async ($, on) => {
+  const { world, clock } = mount(on, { config: { ...ALL_SESSIONS, debug: true, hard_cap_share: 0.2 } })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  world.tokens = 300_000
+  await $.turn.start({ text: 'next', turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  const policies = debugOf(world).filter(l => l.event === 'policy')
+  expect(policies[0].input.lastCompactAfter).toBe(null)
+  expect(policies[1].input.lastCompactAfter).toBe(40_000)
+  // 450k of 1M without the marker: under the 0.5 floor of hard_cap_share, so nothing
+  await clock.advance(1600)
+  world.tokens = 450_000
+  await $.turn.start({ text: 'more', turnId: 't3' })
+  await $.turn.complete(end('Working.', 'answer', 't3'))
+  await clock.advance(5000)
+  expect(ofEvent(world, 'compacted').filter(l => l.trigger === 'hard_cap')).toEqual([])
+})
+
+test('M1/M3: only the end of the turn that started clears "turn running"', async ($, on) => {
+  const { world } = mount(on)
+  await $.session.start(START)
+  await $.turn.start({ text: 'work', turnId: 't1' })
+  await $.turn.complete(end('other', 'answer', 't-other'))
+  expect((await $.command.run({ command: 'compact-now' })).text).toContain('A turn is running')
+  await $.turn.complete(end('Done.', 'answer', 't1'))
+  expect((await $.command.run({ command: 'compact-now' })).text).toContain('Wrapping up')
+  expect(world.toasts.length > 0).toBe(true)
+})
+
+test('M2: a stale idle question (a message came in before its turn) is a normal turn: a marker is a normal close', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 400_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end('Half way there.'))
+  await clock.advance(IDLE + 1000)
+  const q = world.prompts.find(p => p.startsWith('[cc-autocompact] This session has been idle')) ?? ''
+  expect(q).not.toBe('')
+  await say($, 'hello, I am back')
+  await $.turn.start({ text: q, turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  await clock.advance(1600)
+  expect(ofEvent(world, 'compacted')[0].trigger).toBe('task_done')
+  expect(ofEvent(world, 'idle_declined')).toEqual([])
+})
+
+test('M4: the shared log is not written past 2 MiB (said once) or when it looks cut; the session file always is', async ($, on) => {
+  const BIG = `${'{"pad":"'.padEnd(2 * 1024 * 1024 + 10, 'x')}"}\n`
+  const { world, clock } = mount(on, { config: ALL_SESSIONS, written: { [LOG]: BIG } })
+  await $.session.start(START)
+  for (const t of ['t1', 't2']) {
+    world.tokens = 300_000
+    await $.turn.start({ text: 'go', turnId: t })
+    await $.turn.complete(end(WRAP, 'answer', t))
+    await clock.advance(1600)
+  }
+  expect(world.written[LOG]).toBe(BIG)
+  expect(ofEvent(world, 'compacted').length).toBe(2)
+  expect(ofEvent(world, 'error').filter(l => l.reason.includes('past 2 MiB')).length).toBe(1)
+  // A file whose last line has no newline: a write that was cut off
+  world.written[LOG] = '{"half":1}'
+  world.tokens = 300_000
+  await $.turn.start({ text: 'go', turnId: 't3' })
+  await $.turn.complete(end(WRAP, 'answer', 't3'))
+  await clock.advance(1600)
+  expect(world.written[LOG]).toBe('{"half":1}')
+  expect(ofEvent(world, 'error').some(l => l.reason.includes('not written: cut'))).toBe(true)
+})
+
+test('M5: a "light" note defers nothing, so no resume prompt', async ($, on) => {
+  const resetsAt = 1_000_000 + 10 * 60_000
+  const { world, clock } = mount(on, { tokens: 50_000, rateLimits: [{ kind: 'five_hour', percentUsed: 88, resetsAt: iso(resetsAt) }] })
+  await $.session.start(START)
+  await say($, 'run the batch', 'peer')
+  expect(notes(world).some(n => n.includes('at 88%'))).toBe(true)
+  await clock.advance(15 * 60_000)
+  expect(world.prompts.some(p => p.includes('usage limit has reset'))).toBe(false)
+})
+
+test('M5: no resume if a message came in since the deferral, or if the cache is cold and the context big', async ($, on) => {
+  const now0 = 1_000_000
+  const { world, clock } = mount(on, {
+    tokens: 50_000,
+    config: { ...CONFIG, idle_mode: 'off' },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 96, resetsAt: iso(now0 + 5 * 60_000) }],
+  })
+  await $.session.start(START)
+  await say($, 'run the batch', 'peer')
+  await say($, 'I am here', 'composer')
+  await clock.advance(10 * 60_000)
+  expect(world.prompts.some(p => p.includes('usage limit has reset'))).toBe(false)
+  expect(ofEvent(world, 'resume_skipped')[0].reason).toBe('a message came in since')
+
+  // Cold and big: the last response was more than an hour ago, with 300k of context
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  await $.turn.complete(end('Hi.', 'answer', 't1'))
+  await clock.advance(61 * 60_000)
+  world.tokens = 300_000
+  const t = now0 + 71 * 60_000
+  world.rateLimits = [{ kind: 'five_hour', percentUsed: 97, resetsAt: iso(t + 60_000) }]
+  await say($, 'run the batch', 'peer')
+  await clock.advance(5 * 60_000)
+  expect(world.prompts.some(p => p.includes('usage limit has reset'))).toBe(false)
+  expect(ofEvent(world, 'resume_skipped')[1].reason).toBe('the cache is cold and the context is big')
+})
+
+test('M7: if the agent list fails, work counts as running; work that starts during the delay cancels the compaction', async ($, on) => {
+  const { world, clock } = mount(on, { config: ALL_SESSIONS, agentsFail: true })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await clock.advance(1600)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'decision')[0]).toMatchObject({ action: 'wait', reason: 'background work still running' })
+  world.agentsFail = false
+  await $.turn.start({ text: 'go on', turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  world.agents = [{ id: 'a1', description: 'tests', type: 'general-purpose', status: 'running' }]
+  await clock.advance(1600)
+  expect(world.compactions).toBe(0)
+  expect(ofEvent(world, 'cancelled').some(l => l.reason === 'work_running')).toBe(true)
+})
+
+test('LOW: the cancelled-compaction note never goes with a background task; it waits for a real message', async ($, on) => {
+  const { world, clock } = mount(on, { tokens: 512_000, config: ALL_SESSIONS })
+  await $.session.start(START)
+  await $.turn.complete(end(WRAP))
+  await $.turn.start({ text: 'already queued', turnId: 't2' })
+  await clock.advance(1600)
+  await $.turn.complete(end('Long work done.', 'answer', 't2'))
+  await say($, 'task finished', 'task-notification')
+  expect(notes(world)).toEqual([])
+  await say($)
+  expect(notes(world)).toEqual([CANCELLED_512K])
+})
+
+test('LOW: an app compaction is neither a saving nor a cost; the /compact request is not booked as a saving', async ($, on) => {
+  const { world, clock } = mount(on, { reportAfter: 60_000, turnInside: true, config: ALL_SESSIONS }, $)
+  await $.session.start(START)
+  await $.session.compact({ trigger: 'auto', messages: MSGS })
+  await $.turn.start({ text: 'next', turnId: 't1' })
+  await $.turn.complete(end('Hi.', 'answer', 't1'))
+  expect(Object.keys(world.written).some(p => p.includes('/savings/'))).toBe(false)
+  // The mod's compaction: its /compact turn ends inside command.run; that request saves nothing
+  world.tokens = 300_000
+  world.reportAfter = undefined
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await $.turn.complete(end(WRAP, 'answer', 't2'))
+  await clock.advance(1600)
+  const mine = JSON.parse(world.written[`${DATA}/savings/1969-12-29/sid-1.json`])
+  expect(mine.compactions).toBe(1)
+  expect(mine.saved).toBe(0)
+})
+
+test('LOW: /cc-doctor warns when idle_minutes leaves no warm cache', async ($, on) => {
+  mount(on, { config: { ...CONFIG, idle_minutes: 58 } })
+  await $.session.start(START)
+  const out = (await $.command.run({ command: 'cc-doctor' })).text
+  expect(out).toContain('idle_minutes (58) is not under main_cache_ttl_minutes - 5')
 })

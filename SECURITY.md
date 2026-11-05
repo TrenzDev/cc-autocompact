@@ -24,12 +24,12 @@ Only these, inside Claude Code's folder (`~/.claude`, or `CLAUDE_CONFIG_DIR`):
 
 | What | Where |
 | --- | --- |
-| Compaction log | `~/.claude/cc-autocompact/compactions.jsonl` (or `log_file`, which must be a `.jsonl` inside that folder) |
+| Compaction log: decisions, cancellations, retries and compactions, with figures, reasons and session ids, never the text of a message | `~/.claude/cc-autocompact/compactions.jsonl` (or `log_file`, which must be a `.jsonl` inside that folder) |
 | Debug log, only with `"debug": true` | `~/.claude/cc-autocompact/debug.jsonl` |
 | The mod's copy of each project's handoff | `~/.claude/cc-autocompact/handoffs/<hash of the project folder>.json` |
 | Compaction summaries | `~/.claude/compaction-summaries/<project>/` (or `summaries_dir`, which must be inside `~/.claude`; `"off"` writes none) |
 
-A `log_file` or `summaries_dir` outside those folders is refused, the default is used and a toast says so once. The mod never writes inside your projects. The `wrap-up` skill does: the model writes the handoff file there, with Claude Code's normal permissions.
+A `log_file` or `summaries_dir` outside those folders is refused, the default is used and a toast says so once. The mod never writes inside your projects. `/cc-doctor` writes nothing: it reads `config.json` (and lists only key names from it), the log and the engine's usage figures. The `wrap-up` skill does: the model writes the handoff file there, with Claude Code's normal permissions.
 
 The installers (`install.sh`, `install.ps1`) copy the plugin to `~/.claude/mods/cc-autocompact`, move any previous copy to `~/.claude/backups/`, and touch `settings.json` only with `--apply-settings` / `-ApplySettings`. Then they save a backup first and change one key, `env.CLAUDE_CODE_PLUGIN_DIRS`. They download nothing.
 

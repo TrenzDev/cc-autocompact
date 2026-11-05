@@ -17,6 +17,8 @@ Ask yourself: **does what comes next need the context I am carrying?**
 
 If the user asks for it explicitly (types `/wrap-up` or runs `/compact-now`), just wrap up.
 
+If the cc-autocompact mod asks because the session has been idle (its note starts with `[cc-autocompact] This session has been idle`), nobody is watching: apply the check above strictly. Anything half-done, a background task or subagent that still owes a result, or another session waiting for your reply means **do not close**: answer in one line why, without the marker.
+
 ## Steps
 
 1. **Find the handoff file.**
