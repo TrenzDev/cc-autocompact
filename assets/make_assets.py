@@ -434,14 +434,14 @@ def icon(size=512):
 
 
 def install_steps(p):
-    """Three cards: add the marketplace, install the plugin, check it."""
-    w, h = 1280, 300
+    """Three cards: add the marketplace, install the plugin, check it. Narrow, so the text stays readable in a README."""
+    w, h = 1040, 290
     cards = [
         ("add the marketplace", ["In the Code tab: + next to the", "prompt box, Add plugins, then add:"], "TrenzDev/cc-autocompact"),
         ("install the plugin", ["Select cc-autocompact.", "Scope: your user account."], None),
         ("check it", ["Open a new session and type:"], "/cc-doctor"),
     ]
-    cw, ch, gap, top = 360, 190, 40, 58
+    cw, ch, gap, top = 300, 190, 30, 50
     x0 = (w - 3 * cw - 2 * gap) / 2
     out = []
     for i, (name, lines, code) in enumerate(cards):
@@ -449,7 +449,7 @@ def install_steps(p):
         out.append(f'<rect x="{x:.1f}" y="{top}" width="{cw}" height="{ch}" fill="{p["card"]}" stroke="{p["line"]}" stroke-width="1.4" rx="3"/>')
         out.append(f'<circle cx="{x + 34:.1f}" cy="{top + 36}" r="15" fill="{p["ink"]}"/>')
         out.append(sans(x + 34, top + 42, str(i + 1), 16, p["paper"], anchor="middle", weight=700))
-        out.append(L.text(name, x + 60, top + 42, 14, p["ink"], weight=0.15, tracking=0.2))
+        out.append(L.text(name, x + 60, top + 42, 12.5, p["ink"], weight=0.15, tracking=0.2))
         for j, t in enumerate(lines):
             out.append(sans(x + 24, top + 82 + j * 24, t, 15.5, p["soft"]))
         if code:
@@ -459,16 +459,16 @@ def install_steps(p):
         else:
             out.append(sans(x + 24, top + 82 + len(lines) * 24 + 8, "No config file, no Python.", 15.5, p["ink"], weight=600))
         if i < 2:
-            ax = x + cw + 8
+            ax = x + cw + 5
             ay = top + ch / 2
-            out.append(f'<path d="M{ax:.1f} {ay} L{ax + 22:.1f} {ay} M{ax + 15:.1f} {ay - 6} L{ax + 22:.1f} {ay} L{ax + 15:.1f} {ay + 6}" fill="none" stroke="{p["ink"]}" stroke-width="1.8"/>')
+            out.append(f'<path d="M{ax:.1f} {ay} L{ax + 20:.1f} {ay} M{ax + 13:.1f} {ay - 6} L{ax + 20:.1f} {ay} L{ax + 13:.1f} {ay + 6}" fill="none" stroke="{p["ink"]}" stroke-width="1.8"/>')
     return sheet(w, h, p, "".join(out), "Install in three steps: add the marketplace TrenzDev/cc-autocompact, install the plugin at your user scope, open a new session and type /cc-doctor.")
 
 
 def gauge(p):
     """The context as a scale from 0 to a million, with what the plugin does at each mark."""
-    w, h = 1280, 400
-    x0, x1, top, bar = 110, 1170, 190, 28
+    w, h = 1040, 400
+    x0, x1, top, bar = 70, 970, 190, 28
 
     def at(k):
         return x0 + (x1 - x0) * k / 1000
