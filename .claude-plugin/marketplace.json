@@ -8,6 +8,10 @@
     {
       "name": "cc-autocompact",
       "source": "./plugin",
+      "version": "0.6.0",
+      "category": "productivity",
+      "tags": ["compact", "context", "token-usage", "handoff"],
+      "homepage": "https://github.com/TrenzDev/cc-autocompact",
       "description": "Auto-compact for Claude Code when the task ends, not when the context window is full."
     }
   ]

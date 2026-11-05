@@ -2,7 +2,13 @@
 
 Every notable change goes here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] - 2026-11-04
+## [0.6.0] - 2026-11-05
+
+### Install and docs
+
+- The README is shorter and leads with the install, in the desktop app first. Two new drawings: the install in three steps and what the plugin does at each size of context. The settings, the log and the end-to-end check moved to [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+- The `CLAUDE.md` rule is now optional: from 200k the plugin asks the model by itself.
+- Marketplace entry with version, category and tags.
 
 ### Added (phase 2)
 

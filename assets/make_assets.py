@@ -433,6 +433,83 @@ def icon(size=512):
     return f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">{body}</svg>\n'
 
 
+def install_steps(p):
+    """Three cards: add the marketplace, install the plugin, check it."""
+    w, h = 1280, 300
+    cards = [
+        ("add the marketplace", ["In the Code tab: + next to the", "prompt box, Add plugins, then add:"], "TrenzDev/cc-autocompact"),
+        ("install the plugin", ["Select cc-autocompact.", "Scope: your user account."], None),
+        ("check it", ["Open a new session and type:"], "/cc-doctor"),
+    ]
+    cw, ch, gap, top = 360, 190, 40, 58
+    x0 = (w - 3 * cw - 2 * gap) / 2
+    out = []
+    for i, (name, lines, code) in enumerate(cards):
+        x = x0 + i * (cw + gap)
+        out.append(f'<rect x="{x:.1f}" y="{top}" width="{cw}" height="{ch}" fill="{p["card"]}" stroke="{p["line"]}" stroke-width="1.4" rx="3"/>')
+        out.append(f'<circle cx="{x + 34:.1f}" cy="{top + 36}" r="15" fill="{p["ink"]}"/>')
+        out.append(sans(x + 34, top + 42, str(i + 1), 16, p["paper"], anchor="middle", weight=700))
+        out.append(L.text(name, x + 60, top + 42, 14, p["ink"], weight=0.15, tracking=0.2))
+        for j, t in enumerate(lines):
+            out.append(sans(x + 24, top + 82 + j * 24, t, 15.5, p["soft"]))
+        if code:
+            y = top + 82 + len(lines) * 24 + 8
+            out.append(f'<rect x="{x + 24:.1f}" y="{y - 20}" width="{cw - 48}" height="34" fill="{p["paper"]}" stroke="{p["magenta"]}" stroke-width="1.4" rx="2"/>')
+            out.append(mono(x + cw / 2, y + 3, code, 15.5, p["magenta"], anchor="middle", weight=600))
+        else:
+            out.append(sans(x + 24, top + 82 + len(lines) * 24 + 8, "No config file, no Python.", 15.5, p["ink"], weight=600))
+        if i < 2:
+            ax = x + cw + 8
+            ay = top + ch / 2
+            out.append(f'<path d="M{ax:.1f} {ay} L{ax + 22:.1f} {ay} M{ax + 15:.1f} {ay - 6} L{ax + 22:.1f} {ay} L{ax + 15:.1f} {ay + 6}" fill="none" stroke="{p["ink"]}" stroke-width="1.8"/>')
+    return sheet(w, h, p, "".join(out), "Install in three steps: add the marketplace TrenzDev/cc-autocompact, install the plugin at your user scope, open a new session and type /cc-doctor.")
+
+
+def gauge(p):
+    """The context as a scale from 0 to a million, with what the plugin does at each mark."""
+    w, h = 1280, 400
+    x0, x1, top, bar = 110, 1170, 190, 28
+
+    def at(k):
+        return x0 + (x1 - x0) * k / 1000
+
+    zones = [(0, 100, p["grid2"]), (100, 200, p["water"]), (200, 850, p["water2"]), (850, 1000, p["magenta"])]
+    out = []
+    for a, b, colour in zones:
+        out.append(f'<rect x="{at(a):.1f}" y="{top}" width="{at(b) - at(a):.1f}" height="{bar}" fill="{colour}"/>')
+    out.append(f'<rect x="{x0}" y="{top}" width="{x1 - x0}" height="{bar}" fill="none" stroke="{p["ink"]}" stroke-width="1.4"/>')
+    for k in range(0, 1001, 100):
+        x = at(k)
+        out.append(f'<line x1="{x:.1f}" y1="{top + bar}" x2="{x:.1f}" y2="{top + bar + 7}" stroke="{p["ink"]}" stroke-width="1.2"/>')
+        label = "0" if k == 0 else ("1M" if k == 1000 else f"{k}k")
+        out.append(mono(x, top + bar + 24, label, 13, p["soft"], anchor="middle"))
+
+    def above(k, name, lines, anchor="middle", dx=0):
+        x = at(k)
+        out.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top - 32}" stroke="{p["ink"]}" stroke-width="1.2"/>')
+        out.append(f'<circle cx="{x:.1f}" cy="{top - 32}" r="3.5" fill="{p["ink"]}"/>')
+        out.append(L.text(name, x + dx, top - 112, 13.5, p["ink"], weight=0.15, tracking=0.2, anchor=anchor))
+        for j, t in enumerate(lines):
+            out.append(sans(x + dx, top - 86 + j * 22, t, 14.5, p["soft"], anchor=anchor))
+
+    def below(k, name, lines, anchor="middle", dx=0, start=0):
+        x = at(k)
+        y0 = top + bar + start
+        out.append(f'<line x1="{x:.1f}" y1="{y0}" x2="{x:.1f}" y2="{top + bar + 56}" stroke="{p["ink"]}" stroke-width="1.2"/>')
+        out.append(f'<circle cx="{x:.1f}" cy="{top + bar + 56}" r="3.5" fill="{p["ink"]}"/>')
+        out.append(L.text(name, x + dx, top + bar + 84, 13.5, p["ink"], weight=0.15, tracking=0.2, anchor=anchor))
+        for j, t in enumerate(lines):
+            out.append(sans(x + dx, top + bar + 108 + j * 22, t, 14.5, p["soft"], anchor=anchor))
+
+    above(100, "100k floor", ["Below this, nothing", "compacts on its own."])
+    above(200, "200k it asks", ["One short question: is the task closed?", "Again every 100k. It only asks."], anchor="start", dx=-6)
+    above(850, "850k safety net", ["Window 85% full: compacts", "at a turn end, marker or not."])
+    below(150, "150k it pays", ["A closed task compacts", "from about here."])
+    below(300, "300k idle", ["45 minutes quiet, mid-task:", "the model is asked once."], anchor="start", dx=-6, start=30)
+    out.append(sans(x1, top + bar + 130, "Everything in between is the model's call.", 15, p["ink"], anchor="end", weight=600))
+    return sheet(w, h, p, "".join(out), "The context from 0 to a million: below 100k nothing compacts; from about 150k a closed task compacts; from 200k the model is asked whether the task is closed; from 300k an idle session is asked once; at 85% of the window it compacts at a turn end.")
+
+
 def render_png(svg_path, png_path, w, h, browser=None):
     """Renders an SVG to PNG at its own size, with Playwright or a headless Chrome/Edge."""
     url = "file:///" + svg_path.replace("\\", "/")
@@ -479,6 +556,8 @@ def main():
         write(f"flow-{mode}.svg", flow(p))
         write(f"before-after-{mode}.svg", before_after(p, fig))
         write(f"demo-{mode}.svg", demo(p))
+        write(f"install-{mode}.svg", install_steps(p))
+        write(f"gauge-{mode}.svg", gauge(p))
     social_svg = write("social-preview.svg", social(PALETTES["light"]))
     icon_svg = write("icon.svg", icon())
     if a.png:

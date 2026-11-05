@@ -8,7 +8,7 @@ From 200k of context, when a message comes in, the model gets a short question n
 
 If a message cancels a compaction during its 1.5 seconds, the mod tries once more after the next short answer (at most `retry_max_tool_calls` tool calls, 3 by default). Every decision, cancellation, retry and compaction, its own or the app's, is one line in `~/.claude/cc-autocompact/compactions.jsonl`, with the reason and the context before and after, never the text of a message.
 
-Install it in a Claude Code session in the terminal:
+In the desktop app: click **+** next to the prompt box, **Add plugins**, and add the marketplace `TrenzDev/cc-autocompact`. In a Claude Code session in the terminal:
 
 ```text
 /plugin install cc-autocompact --marketplace TrenzDev/cc-autocompact
@@ -16,6 +16,6 @@ Install it in a Claude Code session in the terminal:
 
 It needs no configuration. Optional settings go in `~/.claude/cc-autocompact/config.json`; see `config.example.json` and the full README at https://github.com/TrenzDev/cc-autocompact.
 
-For the model to close tasks by itself, add the "Closing tasks" rule from the README to your `CLAUDE.md`.
+From 200k the mod asks the model whether the task is closed. For it to close smaller tasks by itself as well, add the "Closing tasks" rule from the README to your `CLAUDE.md`.
 
 No network, no shell, and it writes only inside `~/.claude`. After a compaction it puts back only its own copy of the handoff, taken when your wrap-up ended, never a file a repository brought. The question is fixed text plus a number. Details and private reporting: https://github.com/TrenzDev/cc-autocompact/blob/main/SECURITY.md.
